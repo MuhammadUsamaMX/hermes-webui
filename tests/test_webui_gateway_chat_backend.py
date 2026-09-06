@@ -345,6 +345,16 @@ def test_gateway_chat_worker_translates_sse_and_persists_session(tmp_path, monke
     assert isinstance(saved.messages[1]["timestamp"], float)
     assert saved.messages[0]["timestamp"] < saved.messages[1]["timestamp"]
     assert saved.active_stream_id is None
+    # Provider-reported usage must reach the session record; it persisted 0 for
+    # every gateway-backed session before this. last_prompt_tokens stays unset:
+    # gateway usage is summed across the turn's API calls, so it is a billing
+    # total, not the context size ui.js needs for the gauge (#1436).
+    assert saved.input_tokens == 4
+    assert saved.output_tokens == 2
+    # The fixture is a TOOL turn, so the gate deliberately leaves the context
+    # numerator unset: gateway usage is summed across the turn's API calls and
+    # would over-report the prompt size. Tool-free turns do set it.
+    assert not getattr(saved, "last_prompt_tokens", 0)
     assert stream_id not in STREAMS
     assert captured["url"] == "http://gateway.local/v1/chat/completions"
     assert captured["headers"]["Authorization"] == "Bearer secret-token"
@@ -1596,3 +1606,42 @@ def test_gateway_worker_skips_runs_api_when_opt_in_absent():
     finally:
         with STREAMS_LOCK:
             STREAMS.pop(stream_id, None)
+
+
+def test_gateway_stream_usage_survives_junk_and_overflow():
+    """A bad provider token count must not cost the turn its transcript.
+
+    int() on a string/dict/overflowing usage field used to raise inside the SSE
+    read loop, where the outer `except Exception` converted it into "Gateway
+    request failed" and discarded everything the turn had streamed. Each junk
+    key must be skipped, and a good key later in the same chunk still wins.
+    """
+    from api.gateway_chat import _gateway_stream_usage
+
+    # Junk of every shape the wire can carry, including 1e999 -> inf.
+    assert _gateway_stream_usage({"usage": {"prompt_tokens": "not-a-number"}}) == {
+        "input_tokens": 0, "output_tokens": 0, "estimated_cost": 0,
+    }
+    assert _gateway_stream_usage({"usage": {"prompt_tokens": {"nested": 1}}})["input_tokens"] == 0
+    assert _gateway_stream_usage({"usage": {"prompt_tokens": 1e999}})["input_tokens"] == 0
+    assert _gateway_stream_usage({"usage": {"prompt_tokens": float("nan")}})["input_tokens"] == 0
+    # Junk in the first key must fall through to the good alias, not abort.
+    assert _gateway_stream_usage(
+        {"usage": {"prompt_tokens": "junk", "input_tokens": 25546}}
+    )["input_tokens"] == 25546
+    # A non-numeric cost must not poison the whole dict either.
+    assert _gateway_stream_usage(
+        {"usage": {"prompt_tokens": 7, "estimated_cost": "free"}}
+    ) == {"input_tokens": 7, "output_tokens": 0, "estimated_cost": 0}
+    # Hermes gateway extras appear only when sent, so an older gateway keeps the
+    # legacy three-key shape and cannot zero a good session value.
+    assert "last_prompt_tokens" not in _gateway_stream_usage({"usage": {"prompt_tokens": 7}})
+    _rich = _gateway_stream_usage(
+        {"usage": {"prompt_tokens": 7, "last_prompt_tokens": 26194, "threshold_tokens": 750000}}
+    )
+    assert _rich["last_prompt_tokens"] == 26194
+    assert _rich["threshold_tokens"] == 750000
+    # Junk in an extra must be dropped, not raised and not written as garbage.
+    assert "threshold_tokens" not in _gateway_stream_usage(
+        {"usage": {"prompt_tokens": 7, "threshold_tokens": "lots"}}
+    )

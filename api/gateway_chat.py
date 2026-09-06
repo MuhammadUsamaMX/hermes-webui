@@ -1475,6 +1475,19 @@ def _run_gateway_chat_streaming(
             )
         from api.streaming import _session_payload_with_full_messages
         gateway_session_payload = _session_payload_with_full_messages(s, tool_calls=[])
+        # The context ring reads its denominator off `usage`, not off the
+        # session (static/ui.js: `usage.context_length || DEFAULT_CTX`). It does
+        # try to backfill from the browser's cached session, but on a session's
+        # FIRST turn that cache predates the value we just persisted, so the ring
+        # silently divides by 128K - a 1M model then reads 20% at 26k and crosses
+        # the compress-hint line at 6.5% of its real window. Send it explicitly.
+        try:
+            for _ck in ("context_length", "threshold_tokens"):
+                _cv = getattr(s, _ck, 0) or 0
+                if isinstance(_cv, (int, float)) and _cv > 0 and not usage.get(_ck):
+                    usage[_ck] = int(_cv)
+        except Exception:
+            pass
         put_gateway_event("done", {"session": redact_session_data(gateway_session_payload), "usage": usage})
         put_gateway_event("stream_end", {"session_id": session_id})
     except urllib.error.HTTPError as exc:

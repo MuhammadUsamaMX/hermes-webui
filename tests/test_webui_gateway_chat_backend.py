@@ -1645,3 +1645,137 @@ def test_gateway_stream_usage_survives_junk_and_overflow():
     assert "threshold_tokens" not in _gateway_stream_usage(
         {"usage": {"prompt_tokens": 7, "threshold_tokens": "lots"}}
     )
+
+
+def _run_gateway_turn(tmp_path, monkeypatch, session, usage_json, *, model="test-model"):
+    """Drive one gateway turn against a canned terminal usage block.
+
+    Returns the request body the worker actually sent, so the provider-prefix
+    strip can be asserted from the wire rather than from an internal.
+    """
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __iter__(self):
+            yield b'data: {"choices":[{"delta":{"content":"ok"}}],"usage":' + usage_json.encode() + b'}\n\n'
+            yield b'data: [DONE]\n\n'
+
+    def fake_urlopen(req, timeout=0):
+        captured["body"] = req.data.decode("utf-8")
+        return FakeResponse()
+
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://gateway.local")
+    monkeypatch.setattr(streaming, "_load_webui_prefill_context", lambda cfg: {
+        "status": "not_configured", "source": "none", "label": "",
+        "message_count": 0, "messages": [],
+    })
+    monkeypatch.setattr(streaming, "_prefill_messages_with_webui_context", lambda ctx, cfg: [])
+    monkeypatch.setattr(gateway_chat.urllib.request, "urlopen", fake_urlopen)
+
+    stream_id = f"stream-{id(usage_json)}-{len(session.messages)}"
+    session.active_stream_id = stream_id
+    session.pending_user_message = "hi"
+    session.pending_attachments = []
+    session.pending_started_at = 123
+    session.save()
+    channel = create_stream_channel()
+    channel.subscribe()
+    STREAMS[stream_id] = channel
+
+    gateway_chat._run_gateway_chat_streaming(
+        session.session_id, "hi", model, str(tmp_path), stream_id, [],
+    )
+    return captured.get("body", "")
+
+
+def test_gateway_tool_free_fallback_uses_this_turns_prompt_not_the_lifetime_total(tmp_path, monkeypatch):
+    """Second tool-free turn must not inherit the accumulated input total.
+
+    The accumulation loop rewrites usage["input_tokens"] into the session
+    lifetime total so static/messages.js can subtract the pre-turn value. The
+    older-gateway fallback then read that same key as "this turn's prompt", so
+    from turn two onwards the context ring's numerator was a running sum and
+    climbed toward a false "compress now" - the regression #1436 introduced
+    last_prompt_tokens to prevent. Turn one hides it (0 + n == n); turn two is
+    the test.
+    """
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+
+    s = new_session()
+    # No last_prompt_tokens: an older gateway, so the tool-free fallback runs.
+    _run_gateway_turn(tmp_path, monkeypatch, s, '{"prompt_tokens":1000,"completion_tokens":10}')
+    saved = models.get_session(s.session_id)
+    assert saved.last_prompt_tokens == 1000
+    assert saved.input_tokens == 1000
+
+    _run_gateway_turn(tmp_path, monkeypatch, saved, '{"prompt_tokens":1200,"completion_tokens":10}')
+    saved = models.get_session(s.session_id)
+    assert saved.input_tokens == 2200, "billing total still accumulates"
+    assert saved.last_prompt_tokens == 1200, (
+        "context numerator must be this turn's prompt, not the 2200 lifetime sum"
+    )
+
+
+def test_gateway_persists_the_cache_token_split_across_turns(tmp_path, monkeypatch):
+    """cache_read/cache_write are parsed, so they must also be persisted.
+
+    static/messages.js:6055/6134 derives the per-turn cache badge by
+    subtracting the pre-turn session totals, exactly as it does for
+    input/output - so these belong in the same cumulative accumulation, or a
+    reload shows zero.
+    """
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+
+    s = new_session()
+    usage = '{"prompt_tokens":10,"completion_tokens":2,"cache_read_tokens":300,"cache_write_tokens":40}'
+    _run_gateway_turn(tmp_path, monkeypatch, s, usage)
+    _run_gateway_turn(tmp_path, monkeypatch, models.get_session(s.session_id), usage)
+
+    saved = models.get_session(s.session_id)
+    assert saved.cache_read_tokens == 600
+    assert saved.cache_write_tokens == 80
+
+
+def test_gateway_provider_prefix_strip_keeps_colon_tagged_and_host_port_models(tmp_path, monkeypatch):
+    """@provider:model must not lose the model's own colon segment.
+
+    rsplit(":", 1) turns "@openrouter:meta/llama-4:free" into "free"; a plain
+    split(":", 1) would instead turn "@custom:myhost:8080:m" into
+    "myhost:8080:m". The shared #6722 parser knows both grammars, so both the
+    request body and the context-length lookup delegate to it.
+    """
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+
+    s = new_session()
+    body = _run_gateway_turn(
+        tmp_path, monkeypatch, s, '{"prompt_tokens":5,"completion_tokens":1}',
+        model="@openrouter:meta/llama-4:free",
+    )
+    assert json.loads(body)["model"] == "meta/llama-4:free"
+
+    from api.routes import _split_provider_qualified_model
+
+    assert _split_provider_qualified_model("@openrouter:meta/llama-4:free")[0] == "meta/llama-4:free"
+    # #1776's example: a custom-provider slug derived from base_url authority
+    # (host:port) must not be mistaken for an eaten model-tag colon.
+    assert _split_provider_qualified_model("@custom:10.8.71.41:8080:Qwen3") == (
+        "Qwen3", "custom:10.8.71.41:8080",
+    )

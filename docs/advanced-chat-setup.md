@@ -120,3 +120,39 @@ locally and want browser-originated chat to use the same runtime/tool path as
 messaging surfaces. Attachments, cancellation, approvals, and clarify prompts
 still follow WebUI's current compatibility path and may not match every messaging
 surface until the runtime-adapter migration is complete.
+
+### Usage and context-window accounting
+
+A gateway-backed session builds no in-process agent or `ContextCompressor`, so
+the only usage data it ever sees is what the OpenAI-compat terminal chunk
+carries. WebUI now persists that into durable per-session totals and forwards
+enough of it for the browser context ring to size itself correctly:
+
+- `input_tokens`, `output_tokens`, `estimated_cost`, `cache_read_tokens`, and
+  `cache_write_tokens` accumulate into session lifetime totals on every
+  terminal chunk. `static/messages.js` derives each turn's own badge by
+  subtracting the pre-turn session totals, so these fields are cumulative by
+  design, not per-turn.
+- `last_prompt_tokens` is the context ring's numerator. When the connected
+  gateway sends its own `last_prompt_tokens` (the compressor's most recent
+  real prompt size), WebUI uses that value directly — correct on tool turns
+  too. Against an older gateway that omits it, WebUI falls back to a
+  tool-free heuristic: this turn's `input_tokens` slice, used only when the
+  turn made no tool calls. A tool-using turn under that fallback leaves the
+  previous numerator in place rather than reporting a wrong one — safe
+  because it can only under-report, never trigger a false "compress now".
+- `context_length` (the ring's denominator) is resolved once per session from
+  the connected model/provider and persisted, so a browser reload does not
+  re-derive it. `256000` is the resolver's "unknown model" fallback and is
+  deliberately never persisted, so an unrecognized model can still resolve
+  correctly once its metadata becomes available instead of being pinned wrong
+  forever. `threshold_tokens` mirrors the gateway's real compression
+  threshold when sent, or defaults to 75% of `context_length` — the same
+  default `ContextCompressor` uses — so the "Auto-compress at X" tooltip has
+  a number instead of hiding.
+- `@provider:model` route hints are parsed with the shared
+  `_split_provider_qualified_model` grammar (`api/routes.py`, #6722) at both
+  the outgoing request body and the context-length lookup, so a model tag
+  with its own colon (`@openrouter:meta/llama-4:free`) or a custom provider
+  slug derived from a host:port authority
+  (`@custom:10.8.71.41:8080:Qwen3`) resolve to the same lane both places.

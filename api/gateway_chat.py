@@ -1088,15 +1088,23 @@ def _run_gateway_chat_streaming(
                 "stream": True,
                 "messages": [*prefill_messages, {"role": "user", "content": message_content}],
             }
-            # Strip @provider:model prefix (same as runs API path)
+            # Strip @provider:model prefix (same as runs API path). The grammar
+            # is delegated to the shared parser rather than split by hand: a
+            # bare rsplit(":", 1) eats the model's own tag
+            # (@openrouter:meta/llama-4:free -> "free") and a bare
+            # split(":", 1) eats a custom provider's host:port
+            # (@custom:myhost:8080:model). _split_provider_qualified_model
+            # already knows both shapes and its docstring names this path (#6722).
             _body_model = body.get("model", "") or ""
             if _body_model.startswith("@"):
                 try:
-                    _bare, _provider_hint = _body_model[1:].rsplit(":", 1)
-                    if _provider_hint.strip():
-                        body["model"] = _provider_hint.strip()
-                except ValueError:
-                    pass
+                    from api.routes import _split_provider_qualified_model
+
+                    _bare_model, _provider_hint = _split_provider_qualified_model(_body_model)
+                    if _provider_hint and _bare_model:
+                        body["model"] = _bare_model
+                except Exception:
+                    logger.debug("provider-qualified model strip failed", exc_info=True)
             if model_provider:
                 body["provider"] = model_provider
             if reasoning_effort is not None:
@@ -1324,7 +1332,24 @@ def _run_gateway_chat_streaming(
             # here ever wrote usage - it persisted 0 for every session. The
             # terminal SSE chunk already carries it; the agent is fresh per
             # request, so this is the turn's total and accumulates.
-            for _uk in ("input_tokens", "output_tokens", "estimated_cost"):
+            # Read the per-turn prompt size BEFORE the loop below rewrites
+            # usage["input_tokens"] into the lifetime total. The tool-free
+            # fallback further down needs this turn's slice; handing it the
+            # cumulative sum makes the context ring climb every turn, which is
+            # the exact regression #1436 introduced last_prompt_tokens to stop.
+            _turn_input_tokens = usage.get("input_tokens") or 0
+            for _uk in (
+                "input_tokens",
+                "output_tokens",
+                "estimated_cost",
+                # The cache split is parsed by _gateway_stream_usage and read by
+                # static/messages.js (6055/6134), which subtracts the pre-turn
+                # session total exactly as it does for input/output - so these
+                # have to be persisted and reported cumulatively too, or they
+                # read as zero after a reload.
+                "cache_read_tokens",
+                "cache_write_tokens",
+            ):
                 _uv = usage.get(_uk) or 0
                 if isinstance(_uv, (int, float)) and _uv > 0:
                     setattr(s, _uk, (getattr(s, _uk, 0) or 0) + _uv)
@@ -1351,7 +1376,7 @@ def _run_gateway_chat_streaming(
                 if isinstance(_gw_wire, (int, float)) and _gw_wire > 0:
                     s.last_prompt_tokens = int(_gw_wire)
                 else:
-                    _gw_prompt = usage.get("input_tokens") or 0
+                    _gw_prompt = _turn_input_tokens
                     _gw_tool_calls = STREAM_LIVE_TOOL_CALLS.get(stream_id) or []
                     if (
                         isinstance(_gw_prompt, (int, float))
@@ -1375,11 +1400,13 @@ def _run_gateway_chat_streaming(
                     _gw_model = (model or "").strip()
                     if _gw_model.startswith("@"):
                         # '@openrouter:some/model' resolves to the 256K fallback;
-                        # the bare name does not. Same strip the request body does.
-                        try:
-                            _gw_model = _gw_model[1:].rsplit(":", 1)[-1].strip() or _gw_model
-                        except Exception:
-                            pass
+                        # the bare name does not. Same shared strip as the
+                        # request body above, so both resolve the same lane.
+                        from api.routes import _split_provider_qualified_model as _gw_split
+
+                        _gw_bare, _gw_provider_hint = _gw_split(_gw_model)
+                        if _gw_provider_hint and _gw_bare:
+                            _gw_model = _gw_bare
                     _m, _p, _b, _k = _gw_ctx_state(_gw_model, model_provider or "")
                     _gw_ctx_len = _gw_ctx_resolve(_m, _p, base_url=_b, api_key=_k) or 0
                     # 256000 is the resolver's "I do not know this model" default.

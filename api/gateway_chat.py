@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -397,6 +398,12 @@ def _gateway_sse_reasoning_delta(payload: dict) -> str:
         return ""
 
 
+# last_prompt_tokens/threshold_tokens: presence, not truthiness, decides
+# whether a frame's value replaces the running one - see the comment in
+# _gateway_stream_usage(). Shared so every merge site agrees with the parser.
+_CONTEXT_RING_PRESENCE_KEYS = frozenset({"last_prompt_tokens", "threshold_tokens"})
+
+
 def _gateway_stream_usage(payload: dict) -> dict:
     usage = payload.get("usage") if isinstance(payload, dict) else None
     if not isinstance(usage, dict):
@@ -418,8 +425,23 @@ def _gateway_stream_usage(payload: dict) -> dict:
         return 0
 
     try:
-        _cost = usage.get("estimated_cost") or usage.get("estimated_cost_usd") or 0
-        if not isinstance(_cost, (int, float)):
+        _cost = usage.get("estimated_cost")
+        if _cost is None:
+            _cost = usage.get("estimated_cost_usd")
+        # Same relayed-provider-JSON trust boundary as _first_int above, but
+        # costs are legitimately floats so int() can't be the sanitizer here.
+        # A non-finite value (e.g. 1e999 -> +inf) used to survive isinstance()
+        # unchanged, get summed into the session total, and get persisted as
+        # `Infinity` - invalid JSON that then fails to json.loads() on session
+        # restore/list, so the session could no longer load at all. Reject
+        # bool (bool is an int subclass), any non-finite float, and negative
+        # values; keep only a real, usable, non-negative cost.
+        if (
+            isinstance(_cost, bool)
+            or not isinstance(_cost, (int, float))
+            or not math.isfinite(_cost)
+            or _cost < 0
+        ):
             _cost = 0
     except Exception:
         _cost = 0
@@ -432,6 +454,13 @@ def _gateway_stream_usage(payload: dict) -> dict:
     # omits them, and a zero here would overwrite a good session value
     # downstream. Routed through _first_int on purpose - this is the same trust
     # boundary where a bare int() used to cost the turn its transcript.
+    #
+    # last_prompt_tokens/threshold_tokens are presence-sensitive rather than
+    # truthiness-sensitive: the producing gateway's ContextCompressor clamps
+    # its post-compaction sentinel to a real 0 (see hermes-agent#105905), so
+    # an explicit 0 is a meaningful "just compacted" signal, not "no data".
+    # `_val:` alone can't tell that apart from "key absent" (also 0), so those
+    # two check `usage` directly for key presence.
     for _extra in (
         "cache_read_tokens",
         "cache_write_tokens",
@@ -439,7 +468,19 @@ def _gateway_stream_usage(payload: dict) -> dict:
         "threshold_tokens",
     ):
         _val = _first_int(_extra)
-        if _val:
+        # "Present" means a real, usable number, not merely a key in the
+        # payload: junk (a string, a nested dict, an overflowing/NaN float)
+        # must be dropped exactly like _first_int already drops it for the
+        # billing counters, not treated as an authoritative explicit-zero.
+        _raw = usage.get(_extra)
+        _explicit_zero = (
+            _extra in _CONTEXT_RING_PRESENCE_KEYS
+            and isinstance(_raw, (int, float))
+            and not isinstance(_raw, bool)
+            and math.isfinite(_raw)
+            and _raw >= 0
+        )
+        if _val or _explicit_zero:
             out[_extra] = _val
     return out
 
@@ -707,7 +748,7 @@ def _run_gateway_runs_api_streaming(
                     final_text = output
                     if stream_id in STREAM_PARTIAL_TEXT:
                         STREAM_PARTIAL_TEXT[stream_id] = output
-                usage.update({k: v for k, v in _gateway_stream_usage(payload).items() if v})
+                usage.update({k: v for k, v in _gateway_stream_usage(payload).items() if v or k in _CONTEXT_RING_PRESENCE_KEYS})
                 sse_event = "message"
                 continue
             if payload_event == "run.failed":
@@ -730,7 +771,7 @@ def _run_gateway_runs_api_streaming(
                 if stream_id in STREAM_PARTIAL_TEXT:
                     STREAM_PARTIAL_TEXT[stream_id] += delta
                 put_gateway_event("token", {"text": delta})
-            usage.update({k: v for k, v in _gateway_stream_usage(payload).items() if v})
+            usage.update({k: v for k, v in _gateway_stream_usage(payload).items() if v or k in _CONTEXT_RING_PRESENCE_KEYS})
     return final_text, usage
 
 
@@ -1217,8 +1258,8 @@ def _run_gateway_chat_streaming(
                         if stream_id in STREAM_PARTIAL_TEXT:
                             STREAM_PARTIAL_TEXT[stream_id] += delta
                         put_gateway_event("token", {"text": delta})
-                    usage.update({k: v for k, v in _gateway_stream_usage(payload).items() if v})
-            usage.update({k: v for k, v in _gateway_stream_usage(last_payload).items() if v})
+                    usage.update({k: v for k, v in _gateway_stream_usage(payload).items() if v or k in _CONTEXT_RING_PRESENCE_KEYS})
+            usage.update({k: v for k, v in _gateway_stream_usage(last_payload).items() if v or k in _CONTEXT_RING_PRESENCE_KEYS})
         assistant_text = final_text.strip()
         if terminal_error:
             error_payload = _settle_gateway_terminal_error(
@@ -1337,7 +1378,6 @@ def _run_gateway_chat_streaming(
             # fallback further down needs this turn's slice; handing it the
             # cumulative sum makes the context ring climb every turn, which is
             # the exact regression #1436 introduced last_prompt_tokens to stop.
-            _turn_input_tokens = usage.get("input_tokens") or 0
             for _uk in (
                 "input_tokens",
                 "output_tokens",
@@ -1368,25 +1408,31 @@ def _run_gateway_chat_streaming(
             # last_prompt_tokens from the gateway process is the real fix and
             # supersedes this heuristic.
             try:
-                # Preferred: the gateway now reports the compressor's own
-                # last_prompt_tokens - the single most recent real prompt, correct
-                # on tool turns too. Fall back to the tool-free heuristic when
-                # talking to an older gateway that does not send it.
-                _gw_wire = usage.get("last_prompt_tokens") or 0
-                if isinstance(_gw_wire, (int, float)) and _gw_wire > 0:
-                    s.last_prompt_tokens = int(_gw_wire)
-                else:
-                    _gw_prompt = _turn_input_tokens
-                    _gw_tool_calls = STREAM_LIVE_TOOL_CALLS.get(stream_id) or []
-                    if (
-                        isinstance(_gw_prompt, (int, float))
-                        and _gw_prompt > 0
-                        and not _gw_tool_calls
-                    ):
-                        s.last_prompt_tokens = int(_gw_prompt)
-                _gw_thresh = usage.get("threshold_tokens") or 0
-                if isinstance(_gw_thresh, (int, float)) and _gw_thresh > 0:
-                    s.threshold_tokens = int(_gw_thresh)
+                # The gateway reports the compressor's own last_prompt_tokens -
+                # the single most recent real prompt, correct on tool turns too
+                # (hermes-agent#105905). Trust it outright on presence, INCLUDING
+                # an explicit 0 (the compressor's post-compaction clamp) - do not
+                # fall back to a heuristic when the wire value is there.
+                #
+                # An older gateway that omits the key entirely leaves this
+                # branch untaken and the previous numerator stands. There used
+                # to be a tool-free fallback here keyed on "no tool-progress
+                # events observed for this stream_id" - but an empty
+                # STREAM_LIVE_TOOL_CALLS entry only proves no progress events
+                # were *received*; a gateway/proxy that doesn't emit them can
+                # still have run multiple tool calls, and this side has no
+                # authoritative per-turn call count to tell the difference. A
+                # confidently wrong numerator is worse than a stale one, so an
+                # absent key now leaves last_prompt_tokens/threshold_tokens
+                # untouched rather than guess.
+                if "last_prompt_tokens" in usage:
+                    _gw_wire = usage.get("last_prompt_tokens") or 0
+                    if isinstance(_gw_wire, (int, float)):
+                        s.last_prompt_tokens = int(_gw_wire)
+                if "threshold_tokens" in usage:
+                    _gw_thresh = usage.get("threshold_tokens") or 0
+                    if isinstance(_gw_thresh, (int, float)):
+                        s.threshold_tokens = int(_gw_thresh)
             except Exception:
                 pass
 

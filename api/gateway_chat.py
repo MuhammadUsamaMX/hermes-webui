@@ -1465,8 +1465,15 @@ def _run_gateway_chat_streaming(
                 # the real compressor; 75% of the window is the same default
                 # ContextCompressor derives, so the tooltip stops lying about
                 # nothing rather than claiming a precise number we do not have.
+                #
+                # `getattr(..., 0) or 0` treated an authoritative 0 - just
+                # persisted a few lines up when the wire sent
+                # threshold_tokens: 0 - identically to "never set", and
+                # clobbered it with this fabricated default. api/models.py's
+                # Session defaults threshold_tokens to None, so check identity
+                # against that instead of truthiness against 0.
                 _gw_cl_now = getattr(s, "context_length", 0) or 0
-                if _gw_cl_now > 0 and not (getattr(s, "threshold_tokens", 0) or 0):
+                if _gw_cl_now > 0 and getattr(s, "threshold_tokens", None) is None:
                     s.threshold_tokens = int(_gw_cl_now * 0.75)
             except Exception:
                 pass
@@ -1557,7 +1564,12 @@ def _run_gateway_chat_streaming(
         try:
             for _ck in ("context_length", "threshold_tokens"):
                 _cv = getattr(s, _ck, 0) or 0
-                if isinstance(_cv, (int, float)) and _cv > 0 and not usage.get(_ck):
+                # `_ck not in usage`, not `not usage.get(_ck)`: threshold_tokens
+                # can be a real, already-correct 0 in `usage` (the wire wrote it
+                # a few lines up in the try block above), and a truthiness check
+                # would treat that the same as "gateway never sent this field"
+                # and stomp it with the session's fabricated 75% default.
+                if isinstance(_cv, (int, float)) and _cv > 0 and _ck not in usage:
                     usage[_ck] = int(_cv)
         except Exception:
             pass

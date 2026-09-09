@@ -1647,11 +1647,16 @@ def test_gateway_stream_usage_survives_junk_and_overflow():
     )
 
 
-def _run_gateway_turn(tmp_path, monkeypatch, session, usage_json, *, model="test-model"):
+def _run_gateway_turn(tmp_path, monkeypatch, session, usage_json, *, model="test-model", out=None):
     """Drive one gateway turn against a canned terminal usage block.
 
     Returns the request body the worker actually sent, so the provider-prefix
-    strip can be asserted from the wire rather than from an internal.
+    strip can be asserted from the wire rather than from an internal. Pass a
+    dict as `out` to also get the "done" SSE event's `usage` payload back via
+    out["done_usage"] - what static/ui.js's context ring actually reads on a
+    session's first turn, before the browser has any cached session to
+    backfill from (see the comment above the done-event backfill block in
+    api/gateway_chat.py).
     """
     captured = {}
 
@@ -1685,12 +1690,19 @@ def _run_gateway_turn(tmp_path, monkeypatch, session, usage_json, *, model="test
     session.pending_started_at = 123
     session.save()
     channel = create_stream_channel()
-    channel.subscribe()
+    subscriber = channel.subscribe()
     STREAMS[stream_id] = channel
 
     gateway_chat._run_gateway_chat_streaming(
         session.session_id, "hi", model, str(tmp_path), stream_id, [],
     )
+    if out is not None:
+        out["done_usage"] = None
+        while not subscriber.empty():
+            item = subscriber.get_nowait()
+            event, data = item[0], item[1]
+            if event == "done":
+                out["done_usage"] = (data or {}).get("usage")
     return captured.get("body", "")
 
 
@@ -1881,3 +1893,54 @@ def test_gateway_context_ring_trusts_explicit_zero_and_leaves_absent_field_untou
         "signal - the old numerator must stand, not a guess derived from "
         "input_tokens and an empty tool-call list"
     )
+
+
+def test_gateway_explicit_zero_threshold_survives_the_75_percent_default_and_done_event(
+    tmp_path, monkeypatch
+):
+    """threshold_tokens: 0 on the wire must reach BOTH the saved session and
+    the "done" event's usage payload untouched by the fabricated 75%-of-window
+    default - two separate spots downstream of the presence-sensitive parse
+    fix both re-introduced a truthiness check on an already-correct 0:
+
+      1. The "Auto-compress at X" tooltip default (`not (... or 0)`) treated
+         a persisted 0 as "never set" and overwrote it with
+         int(context_length * 0.75).
+      2. The done-event backfill (`not usage.get(_ck)`) treated a present-but-
+         zero usage["threshold_tokens"] the same way and replaced it with the
+         session's now-fabricated value.
+
+    A resolved positive context_length is required to reproduce both - the
+    75% default is a no-op without one.
+    """
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+
+    s = new_session()
+    s.context_length = 1_000_000  # already resolved, so the denominator block no-ops
+    s.save()
+
+    out = {}
+    _run_gateway_turn(
+        tmp_path, monkeypatch, s,
+        '{"prompt_tokens":1000,"completion_tokens":10,"last_prompt_tokens":1000,"threshold_tokens":0}',
+        out=out,
+    )
+    saved = models.get_session(s.session_id)
+    assert saved.threshold_tokens == 0, "an explicit wire zero must not become the 750000 default"
+    assert out["done_usage"]["threshold_tokens"] == 0, (
+        "the done event ui.js reads on a session's first turn must carry the same "
+        "zero the session persisted, not a value backfilled from a stale default"
+    )
+
+    # Follow-up turn from an older gateway that omits the field entirely: the
+    # persisted zero must stand, not be reinterpreted as "unset" a turn later.
+    _run_gateway_turn(
+        tmp_path, monkeypatch, models.get_session(s.session_id),
+        '{"prompt_tokens":50,"completion_tokens":5}',
+    )
+    saved = models.get_session(s.session_id)
+    assert saved.threshold_tokens == 0, "an omitted field on a later turn must not revive the default"

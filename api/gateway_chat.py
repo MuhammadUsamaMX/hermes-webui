@@ -486,10 +486,18 @@ def _gateway_stream_usage(payload: dict) -> dict:
         # where the outer `except Exception` turns it into "Gateway request
         # failed" - the whole turn's transcript discarded over one bad usage
         # field. Skip the junk, keep the turn.
+        #
+        # A sane ceiling (100 M tokens) rejects absurd values that are
+        # technically valid ints (e.g. 10**309) — these are always junk from
+        # a broken provider relay and must never be persisted as-is.
+        _MAX_TOKENS = 100_000_000
         for key in keys:
             try:
-                value = int(usage.get(key) or 0)
+                raw = usage.get(key) or 0
+                value = int(raw)
             except (TypeError, ValueError, OverflowError):
+                continue
+            if isinstance(raw, bool) or value < 0 or value > _MAX_TOKENS:
                 continue
             if value:
                 return value
@@ -544,13 +552,18 @@ def _gateway_stream_usage(payload: dict) -> dict:
         # must be dropped exactly like _first_int already drops it for the
         # billing counters, not treated as an authoritative explicit-zero.
         _raw = usage.get(_extra)
-        _explicit_zero = (
-            _extra in _CONTEXT_RING_PRESENCE_KEYS
-            and isinstance(_raw, (int, float))
-            and not isinstance(_raw, bool)
-            and math.isfinite(_raw)
-            and _raw >= 0
-        )
+        try:
+            _explicit_zero = (
+                _extra in _CONTEXT_RING_PRESENCE_KEYS
+                and isinstance(_raw, (int, float))
+                and not isinstance(_raw, bool)
+                and math.isfinite(_raw)
+                and _raw >= 0
+                and _raw == int(_raw)  # reject fractional floats (0.5 → 0)
+                and _raw <= 100_000_000  # sane ceiling, same as _first_int
+            )
+        except (OverflowError, ValueError):
+            _explicit_zero = False
         if _val or _explicit_zero:
             out[_extra] = _val
     return out
@@ -1470,6 +1483,13 @@ def _run_gateway_chat_streaming(
             s.pending_started_at = None
             s.pending_user_source = None
             s.workspace = str(workspace)
+            # Capture prior identity BEFORE mutation so the model-change
+            # detection below can actually see a change.  Without this,
+            # s.model is already `model` by the time the comparison runs,
+            # so _model_changed is always False and stale context metadata
+            # silently survives a model switch.
+            _prev_model = getattr(s, "model", None)
+            _prev_model_provider = getattr(s, "model_provider", None)
             s.model = model
             s.model_provider = model_provider
             # Gateway turns build no in-process agent/compressor, so nothing else
@@ -1574,8 +1594,8 @@ def _run_gateway_chat_streaming(
                 from api.routes import _session_model_identity_matches as _gw_ids_match
 
                 _model_changed = not _gw_ids_match(
-                    getattr(s, "model", None),
-                    getattr(s, "model_provider", None),
+                    _prev_model,
+                    _prev_model_provider,
                     model,
                     model_provider,
                 )
@@ -1611,9 +1631,16 @@ def _run_gateway_chat_streaming(
                         from api.config import get_config as _gw_gc
 
                         _gw_profile_cfg = _gw_gc()
+                    # _gw_ctx_state resolves base_url/api_key from the
+                    # ambient/default config.  For non-default profiles we
+                    # need the profile's own values — pass them through
+                    # _gw_cli via cfg instead of from ambient state, so the
+                    # profile-aware lookup picks up the right endpoint.
                     _m, _p, _b, _k = _gw_ctx_state(_gw_model, model_provider or "")
                     _gw_lk = _gw_cli(
-                        _m, _p, base_url=_b, api_key=_k,
+                        _m, _p,
+                        base_url="" if _gw_profile_cfg else _b,
+                        api_key="" if _gw_profile_cfg else _k,
                         cfg=_gw_profile_cfg if isinstance(_gw_profile_cfg, dict) else {},
                     )
                     try:

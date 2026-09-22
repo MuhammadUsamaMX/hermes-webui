@@ -1955,3 +1955,108 @@ def test_gateway_explicit_zero_threshold_survives_the_75_percent_default_and_don
     )
     saved = models.get_session(s.session_id)
     assert saved.threshold_tokens == 0, "an omitted field on a later turn must not revive the default"
+
+
+def test_gateway_stream_usage_survives_huge_int_overflow():
+    """An absurdly large token count (>= ~10**309) must not raise
+    OverflowError inside math.isfinite.  The parser must treat it as junk
+    and return 0, exactly like a string or NaN.
+
+    This is the specific edge case from the review: math.isfinite() on an
+    int that large raises OverflowError (int too large to convert to float)
+    because float(int) overflows.  Before the fix this happened inside the
+    SSE read loop, turning the turn into an apperror.
+    """
+    from api.gateway_chat import _gateway_stream_usage
+
+    huge = 10 ** 309
+    # Huge in a billing counter must be dropped.
+    assert _gateway_stream_usage({"usage": {"prompt_tokens": huge}})["input_tokens"] == 0
+    assert _gateway_stream_usage({"usage": {"completion_tokens": huge}})["output_tokens"] == 0
+    # Huge in a context-ring extra must be dropped, not raise.
+    result = _gateway_stream_usage(
+        {"usage": {"prompt_tokens": 10, "last_prompt_tokens": huge, "threshold_tokens": huge}}
+    )
+    assert result["input_tokens"] == 10
+    assert "last_prompt_tokens" not in result
+    assert "threshold_tokens" not in result
+    # Negative values must also be rejected.
+    assert _gateway_stream_usage({"usage": {"prompt_tokens": -5}})["input_tokens"] == 0
+    # bool must be rejected (bool is an int subclass).
+    assert _gateway_stream_usage({"usage": {"prompt_tokens": True}})["input_tokens"] == 0
+    # Fractional float is truncated by _first_int (int(1.5) → 1) which is
+    # acceptable for billing counters.  But in the context-ring explicit_zero
+    # path, fractional values must be rejected — 0.5 must not become a
+    # meaningful "explicit zero" sentinel.
+    result = _gateway_stream_usage(
+        {"usage": {"prompt_tokens": 10, "threshold_tokens": 0.5}}
+    )
+    assert result["input_tokens"] == 10
+    assert "threshold_tokens" not in result
+
+
+def test_gateway_model_switch_triggers_context_resolution(
+    tmp_path, monkeypatch
+):
+    """When the gateway session switches models mid-session, the worker
+    must detect the change and re-resolve context_length — not silently
+    keep the old model's context metadata.
+
+    Before the fix, s.model was assigned BEFORE the identity comparison,
+    so _model_changed was always False and stale context_length persisted.
+    """
+    from unittest.mock import patch as _mock_patch
+
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+
+    s = new_session()
+    # Pretend a prior turn with model A set context_length = 100_000.
+    s.context_length = 100_000
+    s.threshold_tokens = 75_000
+    s.model = "model-a"
+    s.model_provider = "openai"
+    s.save()
+
+    # Now run a turn with a DIFFERENT model.  The worker must detect
+    # the switch and re-resolve context_length to model B's value.
+    def fake_resolve(model_id, **kw):
+        if "model-b" in str(model_id):
+            return ("model-b", "anthropic", "https://api.anthropic.com")
+        return (model_id, "openai", "https://api.openai.com")
+
+    def fake_ctx_len(model_id, base_url, **kw):
+        if "model-b" in str(model_id):
+            return 200_000  # model B has a different window
+        return 100_000
+
+    # Mock the ambient resolution (used by _gw_ctx_state).
+    import api.routes as _routes
+    original_resolve = getattr(_routes, "resolve_model_provider", None)
+    _routes.resolve_model_provider = staticmethod(fake_resolve)
+    try:
+        with _mock_patch(
+            "agent.model_metadata.get_model_context_length",
+            side_effect=fake_ctx_len,
+        ):
+            _run_gateway_turn(
+                tmp_path, monkeypatch, s,
+                '{"prompt_tokens":500,"completion_tokens":10}',
+                model="model-b",
+            )
+    finally:
+        if original_resolve is not None:
+            _routes.resolve_model_provider = original_resolve
+
+    saved = models.get_session(s.session_id)
+    # Context length must have been re-resolved for model B.
+    assert saved.model == "model-b"
+    assert saved.context_length == 200_000, (
+        f"Expected 200000 (model B's window) but got {saved.context_length} — "
+        "model-switch detection failed and stale model-A metadata persisted"
+    )
+    # Threshold must have been rescaled.
+    assert saved.threshold_tokens == 150_000  # 75% of 200_000

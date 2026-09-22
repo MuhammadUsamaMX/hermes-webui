@@ -7428,8 +7428,19 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         # that IS reachable.  By probing named custom_providers first we
         # ensure they get their live /v1/models data populated within the
         # budget even when the active endpoint is unreachable.
+        #
+        # SINGLE-FLIGHT GUARD: when the active base_url matches a named
+        # custom provider's base_url, probe once and populate both the
+        # named group AND auto_detected_models_by_provider from that one
+        # result.  Without this, both blocks probe the same URL, doubling
+        # latency and potentially exceeding the rebuild budget on cold
+        # loads (#7481 review).
         auto_detected_models = []
         auto_detected_models_by_provider: dict[str, list[dict]] = {}
+
+        # Pre-resolve active endpoint identity for single-flight dedup.
+        _norm_active_base_url = _normalize_base_url_for_match(cfg_base_url) if cfg_base_url else ""
+        _deferred_overlap_slugs: set[str] = set()  # slugs skipped by single-flight guard
 
         _custom_providers_cfg = cfg.get("custom_providers", [])
         _named_custom_groups: dict = {}
@@ -7482,6 +7493,10 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     )
                     _live_models = auto_detected_models_by_provider.get(_slug)
                     _live_error = None
+                    _is_active_endpoint_overlap = (
+                        _norm_active_base_url
+                        and _normalize_base_url_for_match(_cp_base_url) == _norm_active_base_url
+                    )
                     if _cp_has_configured_models:
                         # Skip the live /v1/models probe when an allowlist
                         # exists — the curated list wins and probe failures
@@ -7491,6 +7506,15 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                         # populated (cheap to keep).
                         if _live_models is None:
                             _live_models = []
+                    elif _is_active_endpoint_overlap:
+                        # Single-flight: this named provider's base_url IS
+                        # the active endpoint.  Skip the probe here; the
+                        # active-endpoint block below will probe once and
+                        # populate auto_detected_models_by_provider for this
+                        # slug.  We read from that map after the active block
+                        # runs (deferred population below).
+                        _deferred_overlap_slugs.add(_slug)
+                        _live_models = None  # sentinel: will be filled later
                     elif _live_models is None:
                         _live_models, _live_error = _read_custom_endpoint_models(
                             _cp_base_url,
@@ -7501,7 +7525,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     if _live_error:
                         _named_custom_errors[_slug] = _live_error
                         detected_providers.add(_slug)
-                    for _live_model in _live_models:
+                    for _live_model in (_live_models or []):
                         _live_id = str(_live_model.get("id") or "").strip()
                         if not _live_id:
                             continue
@@ -7624,6 +7648,30 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 provider_key = provider.lower()
                 auto_detected_models_by_provider.setdefault(provider_key, []).append(auto_model)
                 detected_providers.add(provider_key)
+            # Propagate active endpoint error to deferred named groups
+            # (single-flight overlap) so they surface the diagnostic.
+            if _active_endpoint_error:
+                for _slug in _deferred_overlap_slugs:
+                    _named_custom_errors[_slug] = _active_endpoint_error
+
+        # Deferred population: fill named groups that were skipped by the
+        # single-flight guard (active ≡ named overlap).  The active block
+        # above has populated auto_detected_models_by_provider for the
+        # overlapping slug; now propagate those models into the named group.
+        for _slug, (_nc_display, _nc_models) in _named_custom_groups.items():
+            if not _nc_models and _slug in auto_detected_models_by_provider:
+                for _m in auto_detected_models_by_provider[_slug]:
+                    _live_id = str(_m.get("id") or "").strip()
+                    if not _live_id:
+                        continue
+                    _dedup_key = f"{_slug}:{_live_id}"
+                    _cp_option_id = _live_id
+                    if active_provider != _slug and not _cp_option_id.startswith("@"):
+                        _cp_option_id = f"@{_slug}:{_cp_option_id}"
+                    _nc_models.append(
+                        {"id": _cp_option_id, "label": _m.get("label") or _get_label_for_model(_live_id, [])}
+                    )
+                    detected_providers.add(_slug)
 
         _has_custom_providers = isinstance(_custom_providers_cfg, list) and len(_custom_providers_cfg) > 0
         if active_provider and active_provider != "custom" and not _has_custom_providers:

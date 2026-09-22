@@ -7418,86 +7418,18 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 logger.debug("Custom endpoint unreachable or misconfigured for provider %s: %s", provider, error)
                 return [], error
 
-        # 4. Fetch models from custom endpoint if base_url is configured
+        # 4. Fetch models from custom endpoints.
+        # CRITICAL ORDERING (#7481): probe named custom_providers FIRST,
+        # THEN the active endpoint (model.base_url).  During a cold catalog
+        # rebuild the active endpoint is probed serially; if it is unreachable
+        # (very common for local/LAN endpoints like LM Studio or Ollama on
+        # another host), its full connect timeout (CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS)
+        # consumes the entire rebuild budget, starving every custom provider
+        # that IS reachable.  By probing named custom_providers first we
+        # ensure they get their live /v1/models data populated within the
+        # budget even when the active endpoint is unreachable.
         auto_detected_models = []
         auto_detected_models_by_provider: dict[str, list[dict]] = {}
-        if cfg_base_url:
-            base_url = cfg_base_url.strip()
-            configured_provider = _configured_provider_for_base_url(base_url)
-            provider = configured_provider or "custom"
-            provider_from_config = bool(configured_provider)
-            parsed = urlparse(base_url if "://" in base_url else f"http://{base_url}")
-            host = (parsed.netloc or parsed.path).lower()
-
-            if parsed.hostname and not provider_from_config:
-                try:
-                    import ipaddress
-
-                    addr = ipaddress.ip_address(parsed.hostname)
-                    if addr.is_private or addr.is_loopback or addr.is_link_local:
-                        if "ollama" in host or "127.0.0.1" in host or "localhost" in host:
-                            provider = "ollama"
-                        elif "lmstudio" in host or "lm-studio" in host:
-                            provider = "lmstudio"
-                        else:
-                            # Unknown loopback/private endpoint: route through
-                            # the generic ``custom`` provider so the agent's
-                            # auxiliary client (compression, vision, web
-                            # extraction) takes the OpenAI-compat custom path
-                            # with ``no-key-required`` semantics. Writing
-                            # ``provider: local`` here used to break
-                            # compression mid-conversation because ``local``
-                            # is not a registered provider in
-                            # ``hermes_cli.auth.PROVIDER_REGISTRY`` — see #1384.
-                            provider = "custom"
-                except ValueError:
-                    pass
-
-            api_key = ""
-            if isinstance(model_cfg, dict):
-                api_key = (model_cfg.get("api_key") or "").strip()
-            if not api_key:
-                providers_cfg = cfg.get("providers", {})
-                if isinstance(providers_cfg, dict):
-                    for provider_key in filter(None, [active_provider, "custom"]):
-                        provider_cfg = providers_cfg.get(provider_key, {})
-                        if isinstance(provider_cfg, dict):
-                            api_key = (provider_cfg.get("api_key") or "").strip()
-                            if api_key:
-                                break
-            if not api_key:
-                api_key_vars = (
-                    "HERMES_API_KEY",
-                    "HERMES_OPENAI_API_KEY",
-                    "OPENAI_API_KEY",
-                    "LOCAL_API_KEY",
-                    "OPENROUTER_API_KEY",
-                    "API_KEY",
-                )
-                for key in api_key_vars:
-                    api_key = (all_env.get(key) or _thread_local_env_value(key) or "").strip()
-                    if api_key:
-                        break
-
-            _trusted_custom_bases: list[object] = [cfg_base_url]
-            _custom_providers_for_trust = cfg.get("custom_providers", [])
-            if isinstance(_custom_providers_for_trust, list):
-                _trusted_custom_bases.extend(
-                    _cp.get("base_url")
-                    for _cp in _custom_providers_for_trust
-                    if isinstance(_cp, dict) and _cp.get("base_url")
-                )
-            _active_endpoint_models, _active_endpoint_error = _read_custom_endpoint_models(
-                base_url,
-                provider,
-                api_key=api_key,
-                trusted_base_urls=tuple(_trusted_custom_bases),
-            )
-            for auto_model in _active_endpoint_models:
-                auto_detected_models.append(auto_model)
-                provider_key = provider.lower()
-                auto_detected_models_by_provider.setdefault(provider_key, []).append(auto_model)
-                detected_providers.add(provider_key)
 
         _custom_providers_cfg = cfg.get("custom_providers", [])
         _named_custom_groups: dict = {}
@@ -7610,6 +7542,88 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                         else:
                             auto_detected_models.append({"id": _cp_model, "label": _cp_label})
                             detected_providers.add("custom")
+
+        # NOW probe the active endpoint (model.base_url) AFTER named custom
+        # providers have been populated.  If this endpoint is unreachable the
+        # full connect timeout is spent here, but it no longer starves the
+        # named custom providers above (#7481).
+        if cfg_base_url:
+            base_url = cfg_base_url.strip()
+            configured_provider = _configured_provider_for_base_url(base_url)
+            provider = configured_provider or "custom"
+            provider_from_config = bool(configured_provider)
+            parsed = urlparse(base_url if "://" in base_url else f"http://{base_url}")
+            host = (parsed.netloc or parsed.path).lower()
+
+            if parsed.hostname and not provider_from_config:
+                try:
+                    import ipaddress
+
+                    addr = ipaddress.ip_address(parsed.hostname)
+                    if addr.is_private or addr.is_loopback or addr.is_link_local:
+                        if "ollama" in host or "127.0.0.1" in host or "localhost" in host:
+                            provider = "ollama"
+                        elif "lmstudio" in host or "lm-studio" in host:
+                            provider = "lmstudio"
+                        else:
+                            # Unknown loopback/private endpoint: route through
+                            # the generic ``custom`` provider so the agent's
+                            # auxiliary client (compression, vision, web
+                            # extraction) takes the OpenAI-compat custom path
+                            # with ``no-key-required`` semantics. Writing
+                            # ``provider: local`` here used to break
+                            # compression mid-conversation because ``local``
+                            # is not a registered provider in
+                            # ``hermes_cli.auth.PROVIDER_REGISTRY`` — see #1384.
+                            provider = "custom"
+                except ValueError:
+                    pass
+
+            api_key = ""
+            if isinstance(model_cfg, dict):
+                api_key = (model_cfg.get("api_key") or "").strip()
+            if not api_key:
+                providers_cfg = cfg.get("providers", {})
+                if isinstance(providers_cfg, dict):
+                    for provider_key in filter(None, [active_provider, "custom"]):
+                        provider_cfg = providers_cfg.get(provider_key, {})
+                        if isinstance(provider_cfg, dict):
+                            api_key = (provider_cfg.get("api_key") or "").strip()
+                            if api_key:
+                                break
+            if not api_key:
+                api_key_vars = (
+                    "HERMES_API_KEY",
+                    "HERMES_OPENAI_API_KEY",
+                    "OPENAI_API_KEY",
+                    "LOCAL_API_KEY",
+                    "OPENROUTER_API_KEY",
+                    "API_KEY",
+                )
+                for key in api_key_vars:
+                    api_key = (all_env.get(key) or _thread_local_env_value(key) or "").strip()
+                    if api_key:
+                        break
+
+            _trusted_custom_bases: list[object] = [cfg_base_url]
+            _custom_providers_for_trust = cfg.get("custom_providers", [])
+            if isinstance(_custom_providers_for_trust, list):
+                _trusted_custom_bases.extend(
+                    _cp.get("base_url")
+                    for _cp in _custom_providers_for_trust
+                    if isinstance(_cp, dict) and _cp.get("base_url")
+                )
+            _active_endpoint_models, _active_endpoint_error = _read_custom_endpoint_models(
+                base_url,
+                provider,
+                api_key=api_key,
+                trusted_base_urls=tuple(_trusted_custom_bases),
+            )
+            for auto_model in _active_endpoint_models:
+                auto_detected_models.append(auto_model)
+                provider_key = provider.lower()
+                auto_detected_models_by_provider.setdefault(provider_key, []).append(auto_model)
+                detected_providers.add(provider_key)
 
         _has_custom_providers = isinstance(_custom_providers_cfg, list) and len(_custom_providers_cfg) > 0
         if active_provider and active_provider != "custom" and not _has_custom_providers:

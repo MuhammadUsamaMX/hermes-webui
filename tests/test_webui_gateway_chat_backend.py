@@ -347,8 +347,10 @@ def test_gateway_chat_worker_translates_sse_and_persists_session(tmp_path, monke
     assert saved.active_stream_id is None
     # Provider-reported usage must reach the session record; it persisted 0 for
     # every gateway-backed session before this. last_prompt_tokens stays unset:
-    # gateway usage is summed across the turn's API calls, so it is a billing
-    # total, not the context size ui.js needs for the gauge (#1436).
+    # gateway usage is the terminal chunk's prompt_tokens, which is the full
+    # context for THIS turn; it represents the billing total and context ring
+    # denominator (#1436). Per-turn overwrite (#1857) means this field stores
+    # the latest prompt size, not a cumulative sum.
     assert saved.input_tokens == 4
     assert saved.output_tokens == 2
     # The fixture is a TOOL turn, so the gate deliberately leaves the context
@@ -1718,6 +1720,11 @@ def test_gateway_absent_last_prompt_tokens_never_inherits_the_billing_total(tmp_
     *received*, not that no tools ran, on a gateway/proxy that omits those
     optional events (defect #3). The fix removes the guess entirely - absent
     means untouched, full stop.
+
+    Usage fields now use per-turn overwrite semantics (#1857): the gateway's
+    terminal prompt_tokens is the full context for THIS turn, not a delta,
+    so adding across turns inflated the context ring numerator. After the fix,
+    s.input_tokens reflects the latest turn's prompt size.
     """
     session_dir = tmp_path / "sessions"
     session_dir.mkdir()
@@ -1730,13 +1737,16 @@ def test_gateway_absent_last_prompt_tokens_never_inherits_the_billing_total(tmp_
     _run_gateway_turn(tmp_path, monkeypatch, s, '{"prompt_tokens":1000,"completion_tokens":10}')
     saved = models.get_session(s.session_id)
     assert saved.last_prompt_tokens is None, "no wire signal means no numerator, not a guess"
-    assert saved.input_tokens == 1000, "the billing total still accumulates independently"
+    assert saved.input_tokens == 1000, "per-turn overwrite: latest prompt_tokens"
 
     _run_gateway_turn(tmp_path, monkeypatch, saved, '{"prompt_tokens":1200,"completion_tokens":10}')
     saved = models.get_session(s.session_id)
-    assert saved.input_tokens == 2200, "billing total keeps accumulating"
+    assert saved.input_tokens == 1200, (
+        "overwrite with latest turn's prompt_tokens, not accumulate (2200 would "
+        "inflate the context ring and trigger false compression warnings)"
+    )
     assert saved.last_prompt_tokens is None, (
-        "must never silently become the 2200 lifetime sum just because two "
+        "must never silently become the 1200 prompt size just because two "
         "tool-free-looking turns went by"
     )
 
@@ -1746,8 +1756,9 @@ def test_gateway_persists_the_cache_token_split_across_turns(tmp_path, monkeypat
 
     static/messages.js:6055/6134 derives the per-turn cache badge by
     subtracting the pre-turn session totals, exactly as it does for
-    input/output - so these belong in the same cumulative accumulation, or a
-    reload shows zero.
+    input/output. Per-turn overwrite (#1857): the gateway's terminal
+    cache_read_tokens is the cache reads for THIS turn, not a cumulative
+    total, so the session stores the latest turn's value.
     """
     session_dir = tmp_path / "sessions"
     session_dir.mkdir()
@@ -1761,8 +1772,8 @@ def test_gateway_persists_the_cache_token_split_across_turns(tmp_path, monkeypat
     _run_gateway_turn(tmp_path, monkeypatch, models.get_session(s.session_id), usage)
 
     saved = models.get_session(s.session_id)
-    assert saved.cache_read_tokens == 600
-    assert saved.cache_write_tokens == 80
+    assert saved.cache_read_tokens == 300, "overwrite with latest turn's cache reads"
+    assert saved.cache_write_tokens == 40, "overwrite with latest turn's cache writes"
 
 
 def test_gateway_provider_prefix_strip_keeps_colon_tagged_and_host_port_models(tmp_path, monkeypatch):

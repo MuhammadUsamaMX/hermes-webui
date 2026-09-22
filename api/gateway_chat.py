@@ -1474,31 +1474,48 @@ def _run_gateway_chat_streaming(
             s.model_provider = model_provider
             # Gateway turns build no in-process agent/compressor, so nothing else
             # here ever wrote usage - it persisted 0 for every session. The
-            # terminal SSE chunk already carries it; the agent is fresh per
-            # request, so this is the turn's total and accumulates.
-            # Read the per-turn prompt size BEFORE the loop below rewrites
-            # usage["input_tokens"] into the lifetime total. The tool-free
-            # fallback further down needs this turn's slice; handing it the
-            # cumulative sum makes the context ring climb every turn, which is
-            # the exact regression #1436 introduced last_prompt_tokens to stop.
+            # terminal SSE chunk carries the turn's usage; the agent is fresh
+            # per request, so prompt_tokens is the full context for THIS turn,
+            # not a delta. Per-turn overwrite (#1857): replace the session's
+            # stored totals with the latest values from the wire, matching the
+            # local streaming path (api/streaming.py:12164-12173). Adding
+            # across turns (the old `s.field += delta`) would inflate the
+            # context ring numerator and trigger false compression warnings.
+            #
+            # Best-effort: wrap all metadata mutation so a legacy string
+            # counter or type mismatch in a persisted session row can never
+            # prevent transcript persistence. Usage is a nicety; the
+            # transcript is the product.
+            try:
+                _it = usage.get("input_tokens") or 0
+                if isinstance(_it, (int, float)) and _it > 0:
+                    s.input_tokens = int(_it)
+                _ot = usage.get("output_tokens") or 0
+                if isinstance(_ot, (int, float)) and _ot > 0:
+                    s.output_tokens = int(_ot)
+                _ec = usage.get("estimated_cost")
+                if (
+                    isinstance(_ec, (int, float))
+                    and not isinstance(_ec, bool)
+                    and math.isfinite(_ec)
+                    and _ec >= 0
+                ):
+                    s.estimated_cost = _ec
+                _cr = usage.get("cache_read_tokens") or 0
+                if isinstance(_cr, (int, float)) and _cr > 0:
+                    s.cache_read_tokens = int(_cr)
+                _cw = usage.get("cache_write_tokens") or 0
+                if isinstance(_cw, (int, float)) and _cw > 0:
+                    s.cache_write_tokens = int(_cw)
+            except Exception:
+                logger.debug("Usage persistence failed for session %s", session_id, exc_info=True)
+            # Report the session's current totals (overwritten above), which
+            # the browser uses for per-turn badges (messages.js subtracts the
+            # pre-turn session total from these values).
             for _uk in (
-                "input_tokens",
-                "output_tokens",
-                "estimated_cost",
-                # The cache split is parsed by _gateway_stream_usage and read by
-                # static/messages.js (6055/6134), which subtracts the pre-turn
-                # session total exactly as it does for input/output - so these
-                # have to be persisted and reported cumulatively too, or they
-                # read as zero after a reload.
-                "cache_read_tokens",
-                "cache_write_tokens",
+                "input_tokens", "output_tokens", "estimated_cost",
+                "cache_read_tokens", "cache_write_tokens",
             ):
-                _uv = usage.get(_uk) or 0
-                if isinstance(_uv, (int, float)) and _uv > 0:
-                    setattr(s, _uk, (getattr(s, _uk, 0) or 0) + _uv)
-                # Report the persisted lifetime total, not this turn's slice:
-                # static/messages.js derives the per-turn badge by subtracting
-                # the pre-turn session total, so it needs cumulative numbers.
                 usage[_uk] = getattr(s, _uk, 0) or 0
 
             # Context-ring fields (ui.js #1436). Numerator: the gateway sums
@@ -1541,10 +1558,35 @@ def _run_gateway_chat_streaming(
 
             # Denominator: without context_length ui.js divides by
             # DEFAULT_CTX = 128*1024 and mis-sizes the ring for every 1M model.
+            #
+            # Two resolution triggers:
+            #   1. context_length is empty (first turn or after a reset).
+            #   2. The model/provider identity changed since the last turn —
+            #      the old window may belong to a different model entirely.
+            #
+            # Non-default profiles must resolve through their own config, not
+            # the ambient/default one: a detached worker loads config from
+            # s.profile (established #3294 rule), and a wrong positive
+            # context_length persisted here would never self-correct because
+            # normal hydration skips resolution when the field is non-empty.
             try:
-                if not (getattr(s, "context_length", 0) or 0):
-                    from api.routes import _resolve_context_length_for_session_model as _gw_ctx_resolve
-                    from api.routes import _session_context_length_lookup_state as _gw_ctx_state
+                _persisted_cl = getattr(s, "context_length", 0) or 0
+                from api.routes import _session_model_identity_matches as _gw_ids_match
+
+                _model_changed = not _gw_ids_match(
+                    getattr(s, "model", None),
+                    getattr(s, "model_provider", None),
+                    model,
+                    model_provider,
+                )
+                _needs_resolve = (not _persisted_cl) or _model_changed
+                if _needs_resolve:
+                    from api.routes import (
+                        _context_length_lookup_inputs_for_model as _gw_cli,
+                        _session_context_length_lookup_state as _gw_ctx_state,
+                        _should_accept_session_context_length_refresh as _gw_accept,
+                    )
+                    from agent.model_metadata import get_model_context_length as _gw_gcl
 
                     _gw_model = (model or "").strip()
                     if _gw_model.startswith("@"):
@@ -1556,28 +1598,51 @@ def _run_gateway_chat_streaming(
                         _gw_bare, _gw_provider_hint = _gw_split(_gw_model)
                         if _gw_provider_hint and _gw_bare:
                             _gw_model = _gw_bare
+                    # Profile-scoped config: detached workers resolve through
+                    # s.profile, not the process-global default (#3294).
+                    try:
+                        from api.config import get_config_for_profile_home as _gw_gcfh
+                        from api.profiles import get_hermes_home_for_profile as _gw_ghpf
+
+                        _gw_profile_cfg = _gw_gcfh(
+                            _gw_ghpf(getattr(s, "profile", None))
+                        )
+                    except Exception:
+                        from api.config import get_config as _gw_gc
+
+                        _gw_profile_cfg = _gw_gc()
                     _m, _p, _b, _k = _gw_ctx_state(_gw_model, model_provider or "")
-                    _gw_ctx_len = _gw_ctx_resolve(_m, _p, base_url=_b, api_key=_k) or 0
-                    # 256000 is the resolver's "I do not know this model" default.
-                    # routes.py only re-resolves when context_length is falsy, so
-                    # persisting the fallback would make a wrong window permanent.
-                    if _gw_ctx_len > 0 and _gw_ctx_len != 256_000:
+                    _gw_lk = _gw_cli(
+                        _m, _p, base_url=_b, api_key=_k,
+                        cfg=_gw_profile_cfg if isinstance(_gw_profile_cfg, dict) else {},
+                    )
+                    try:
+                        _gw_ctx_len = _gw_gcl(
+                            _m,
+                            _gw_lk.base_url,
+                            api_key=_gw_lk.api_key,
+                            config_context_length=_gw_lk.config_context_length,
+                            provider=_gw_lk.provider or _p or "",
+                            custom_providers=_gw_lk.custom_providers,
+                        ) or 0
+                    except TypeError:
+                        _gw_ctx_len = _gw_gcl(_m, _gw_lk.base_url) or 0
+                    # 256000 is the resolver's "I do not know this model"
+                    # default. Accept it only when the model changed (it may be
+                    # the real window for an unknown model); otherwise a
+                    # lower-confidence 256K must not clobber a larger persisted
+                    # value (#4248).
+                    if _gw_accept(_persisted_cl, _gw_ctx_len, model_changed=_model_changed):
                         s.context_length = int(_gw_ctx_len)
-                # Compression trigger for the "Auto-compress at X" tooltip
-                # (ui.js hides the line while this is falsy). The gateway owns
-                # the real compressor; 75% of the window is the same default
-                # ContextCompressor derives, so the tooltip stops lying about
-                # nothing rather than claiming a precise number we do not have.
-                #
-                # `getattr(..., 0) or 0` treated an authoritative 0 - just
-                # persisted a few lines up when the wire sent
-                # threshold_tokens: 0 - identically to "never set", and
-                # clobbered it with this fabricated default. api/models.py's
-                # Session defaults threshold_tokens to None, so check identity
-                # against that instead of truthiness against 0.
-                _gw_cl_now = getattr(s, "context_length", 0) or 0
-                if _gw_cl_now > 0 and getattr(s, "threshold_tokens", None) is None:
-                    s.threshold_tokens = int(_gw_cl_now * 0.75)
+                        # Rescale threshold_tokens when the window changed.
+                        if _persisted_cl and _persisted_cl != _gw_ctx_len and s.threshold_tokens:
+                            from api.routes import _rescale_threshold_tokens_for_context_window as _gw_scale
+
+                            s.threshold_tokens = _gw_scale(
+                                int(s.threshold_tokens), _persisted_cl, _gw_ctx_len,
+                            )
+                        elif s.threshold_tokens is None and _gw_ctx_len > 0:
+                            s.threshold_tokens = int(_gw_ctx_len * 0.75)
             except Exception:
                 pass
 

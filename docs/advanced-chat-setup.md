@@ -161,10 +161,13 @@ carries. WebUI now persists that into durable per-session totals and forwards
 enough of it for the browser context ring to size itself correctly:
 
 - `input_tokens`, `output_tokens`, `estimated_cost`, `cache_read_tokens`, and
-  `cache_write_tokens` accumulate into session lifetime totals on every
-  terminal chunk. `static/messages.js` derives each turn's own badge by
-  subtracting the pre-turn session totals, so these fields are cumulative by
-  design, not per-turn.
+  `cache_write_tokens` use per-turn overwrite semantics (#1857): the gateway's
+  terminal chunk carries the full prompt size / completion count for THIS
+  turn (not a delta), so the session stores the latest value, not a running
+  sum. `static/messages.js` derives each turn's badge by subtracting the
+  pre-turn session total from the done event's usage payload. This matches the
+  local streaming path (`api/streaming.py:12164-12173`) and prevents the
+  context ring numerator from inflating across turns.
 - `last_prompt_tokens` / `threshold_tokens` are presence-sensitive, not
   truthiness-sensitive: an explicit `0` from the gateway (the compressor's
   post-compaction clamp) is trusted outright and overwrites the previous
@@ -181,15 +184,18 @@ enough of it for the browser context ring to size itself correctly:
   gateway or intermediate proxy that doesn't emit those optional events
   would report a multi-call aggregate as if it were a single real prompt,
   which is a confidently wrong numerator and worse than a stale one.
-- `context_length` (the ring's denominator) is resolved once per session from
-  the connected model/provider and persisted, so a browser reload does not
-  re-derive it. `256000` is the resolver's "unknown model" fallback and is
-  deliberately never persisted, so an unrecognized model can still resolve
-  correctly once its metadata becomes available instead of being pinned wrong
-  forever. `threshold_tokens` mirrors the gateway's real compression
-  threshold when sent, or defaults to 75% of `context_length` — the same
-  default `ContextCompressor` uses — so the "Auto-compress at X" tooltip has
-  a number instead of hiding.
+- `context_length` (the ring's denominator) is resolved from the connected
+  model/provider and persisted. It re-resolves when the model/provider
+  identity changes mid-session (e.g. switching from model A to model B),
+  using the session's profile-scoped config (`get_config_for_profile_home`)
+  rather than the ambient default — a detached worker must not inherit the
+  wrong profile's per-model `context_length` override (#3294). The
+  `_should_accept_session_context_length_refresh` guard prevents the resolver's
+  `256000` unknown-model fallback from clobbering a larger persisted value
+  unless the model actually changed (#4248). `threshold_tokens` is rescaled
+  proportionally when the window changes, or defaults to 75% of
+  `context_length` — the same default `ContextCompressor` uses — so the
+  "Auto-compress at X" tooltip has a number instead of hiding.
 - `@provider:model` route hints are parsed with the shared
   `_split_provider_qualified_model` grammar (`api/routes.py`, #6722) at both
   the outgoing request body and the context-length lookup, so a model tag

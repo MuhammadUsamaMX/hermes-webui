@@ -278,6 +278,16 @@ function _setCompressionSessionLock(sid){
   window._compressionLockSid=sid||null;
 }
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function jsArg(s){
+  // Encode a value for safe interpolation inside an inline on* handler's JS
+  // string literal. JSON.stringify quotes/escapes for the JS context; esc()
+  // then makes the result safe inside the HTML attribute. Without this, a
+  // value containing a quote breaks out of the handler (esc() alone is
+  // HTML-escaping, which the browser decodes BEFORE executing the inline
+  // handler). Promoted to a shared helper from the kanban dependency fix
+  // (#3797). Use as onclick="fn(${jsArg(v)})" — no manual quotes.
+  return esc(JSON.stringify(String(s == null ? '' : s)));
+}
 function _matchBacktickFenceLine(line){
   const m=String(line||'').match(/^[ ]{0,3}(`{3,})([^`]*)$/);
   if(!m) return null;
@@ -491,13 +501,23 @@ async function startCompressionRecovery(btn){
     if(!sid) throw new Error('Compression recovery did not return a session.');
     try{localStorage.setItem('hermes-webui-session',sid);}catch(_){}
     if(typeof loadSession==='function') await loadSession(sid,{preserveActiveInput:false});
-    else if(data.session){S.session=data.session;S.messages=data.session.messages||[];syncTopbar();renderMessages();}
+    else if(data.session){S.session=data.session;if(typeof _adoptRegenerationRevision==='function')_adoptRegenerationRevision(data.session);S.messages=data.session.messages||[];syncTopbar();renderMessages();}
     if(typeof renderSessionList==='function') await renderSessionList();
     if(typeof _setActiveSessionUrl==='function') _setActiveSessionUrl(sid);
     if(typeof showToast==='function') showToast((data&&data.message)||'Started focused continuation.',3000,'success');
     const composer=$('msg');
     if(composer&&typeof composer.focus==='function') composer.focus();
   }catch(e){
+    // #7710: a cross-profile refusal now also arrives as 409
+    // (``session_profile_mismatch``). That is NOT a stale recovery action —
+    // the card is still valid, the request was simply refused because the
+    // session belongs to another profile. Retiring it would hide a live card
+    // and show a false "conversation already moved on" note.
+    if(e&&e.status===409&&typeof _sessionProfileMismatchFromError==='function'
+       &&_sessionProfileMismatchFromError(e)){
+      if(typeof setStatus==='function') setStatus('Session belongs to a different profile');
+      return;
+    }
     // A 409 means this session no longer has an active recovery action (the
     // session already moved on — e.g. a substantive prompt cleared it). The
     // persisted card in the transcript is stale, so retire it and show a neutral
@@ -608,6 +628,9 @@ function _resetMessageRenderWindow(sid){
   _clearRenderCache();
   clearVisibleMessageRowCache();
   _clearMessageVirtualHeightCache();
+}
+function _restoreMessageRenderWindowAfterSettledRender(){
+  _messageRenderWindowSize=MESSAGE_RENDER_WINDOW_DEFAULT;
 }
 function _cancelMessageVirtualizedRender(){
   if(_messageVirtualScrollRaf){
@@ -1514,6 +1537,53 @@ function _getCachedRender(text, isUser){
   _renderCache.set(key, rendered);
   return rendered;
 }
+// ── Message-level media snapshot stamping ─────────────────────────────────
+// /api/media serves a file's CURRENT bytes. Since ETag revalidation (#6922),
+// an in-place overwrite (same filename) also rewrites every historical chat
+// preview that referenced it — the old/new comparison is lost. At settle time
+// the backend freezes the bytes of each local-file MEDIA: reference into a
+// content-addressed store and stamps the message with
+// `_media_snapshots: {path: digest}`. This helper rewrites the rendered HTML
+// of ONE message to append `&snap=<digest>` to the matching /api/media URLs
+// (and `data-snap` on lazy-preview placeholders), so old previews keep
+// showing the file as it was when the message was emitted.
+// Runs AFTER the text-keyed render cache: the cache stays pure-text, and each
+// message stamps its own digests — two messages with identical text but
+// different snapshots (exactly the old/new case) resolve independently.
+function _stampMediaSnapshots(html, snaps){
+  if(!html || !snaps || typeof snaps !== 'object') return html;
+  let out = String(html);
+  // Direct media URLs: rewrite each COMPLETE `path=` query value atomically.
+  // Value-level parsing (decode the whole value, exact map lookup) instead of
+  // substring split/join: when one path is a PREFIX of another
+  // (/tmp/a.png vs /tmp/a.png.backup) the naive rewrite corrupts the longer
+  // URL and drops its own digest. Matching is boundary-aware — the value runs
+  // to the next `&` separator or an attribute quote/whitespace — so nothing
+  // outside the value ever moves.
+  out = out.replace(/api\/media[?&]path=([^&"'\s<>]+)/g, (match, encodedPath)=>{
+    let decoded;
+    try{ decoded = decodeURIComponent(encodedPath); }
+    catch(e){ return match; }
+    const digest = snaps[decoded];
+    if(typeof digest === 'string' && /^[0-9a-f]{64}$/.test(digest)){
+      return match + '&snap=' + digest;
+    }
+    return match;
+  });
+  // Lazy-preview placeholders: data-path="<html-escaped raw path>" — match the
+  // complete attribute value, unescape HTML entities, then exact lookup (same
+  // prefix-safety: a longer path's attribute can never be partially matched).
+  const _unescapeHtml=(s)=>String(s||'').replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&amp;/g,'&');
+  out = out.replace(/data-path="([^"]*)"/g, (match, rawValue)=>{
+    const decoded = _unescapeHtml(rawValue);
+    const digest = snaps[decoded];
+    if(typeof digest === 'string' && /^[0-9a-f]{64}$/.test(digest)){
+      return match + ' data-snap="' + digest + '"';
+    }
+    return match;
+  });
+  return out;
+}
 function _currentMessageRenderWindowSize(){
   return Math.max(
     MESSAGE_RENDER_WINDOW_DEFAULT,
@@ -1578,6 +1648,14 @@ async function jumpToSessionStart(){
     // insertion is blocked by !S.busy, losing Activity until "done" fires.
     if(!(S.busy||S.activeStreamId)){
       renderMessages({ preserveScroll:true });
+    }else if(typeof _scheduleMessageVirtualizedRender==='function'){
+      // ...but on a virtualized transcript SOMETHING still has to mount the new
+      // render window. The scroll listener used to do it; it now correctly skips
+      // while a programmatic scroll is in flight (the idle re-render-loop fix),
+      // and this path deliberately does not call renderMessages() — so without an
+      // explicit schedule the jump lands on an all-spacer, zero-row transcript.
+      // Force the window update here, after invalidating _messageVirtualWindowKey.
+      _scheduleMessageVirtualizedRender(true);
     }
     requestAnimationFrame(()=>{
       container.scrollTop=0;
@@ -1613,6 +1691,11 @@ function _highlightQuestionRow(row){
 async function jumpToTurnQuestion(questionRawIdx, assistantRawIdx){
   const container=$('messages');
   if(!container||typeof questionRawIdx!=='number'||questionRawIdx<0) return;
+  const clampTargetScrollTop=(scrollTop)=>{
+    const maxTop=Math.max(0,container.scrollHeight-container.clientHeight);
+    const n=Number(scrollTop);
+    return Math.max(0,Math.min(Number.isFinite(n)?n:container.scrollTop,maxTop));
+  };
   const scrollToTarget=()=>{
     const hasAssistant=typeof assistantRawIdx==='number'&&assistantRawIdx>=0;
     if(hasAssistant){
@@ -1635,14 +1718,18 @@ async function jumpToTurnQuestion(questionRawIdx, assistantRawIdx){
     _highlightQuestionRow(row);
     return true;
   };
+  // Cancel load-time bottom settling before any visible or virtualized target
+  // path can return. The jump owner keeps every native smooth-scroll frame out
+  // of the manual-reader listener, then reconciles against the final geometry.
+  _cancelBottomSettle();
+  _beginMessageJumpScroll(container);
   if(scrollToTarget()) return;
   const visWithIdx=_getVisibleMessagesWithIdx();
   const visibleIdx=_messageVisibleIndexForRawIdx(questionRawIdx, visWithIdx);
   if(visibleIdx>=0){
-    _scrollPinned=false;
-    _messageUserUnpinned=true;
     _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
-    container.scrollTop=_messageVirtualScrollTopForVisibleIdx(visWithIdx, visibleIdx, container);
+    const virtualTarget=clampTargetScrollTop(_messageVirtualScrollTopForVisibleIdx(visWithIdx, visibleIdx, container));
+    container.scrollTop=virtualTarget;
     _messageVirtualWindowKey='';
     renderMessages({ preserveScroll:true });
     requestAnimationFrame(()=>{
@@ -1671,9 +1758,50 @@ let _dashboardLastNonNeverMode='auto'; // Server-scoped dashboard config keeps t
 let _dashboardSettingsLoadSeq=0;
 let _dashboardSettingsWriteSeq=0;
 
+function _dashboardHostIsLoopback(host){
+  // Canonical loopback classifier shared by the browser origin and the
+  // resolved dashboard target. Normalizes brackets, case, zone ids, and a
+  // terminal hostname dot; classifies IPv4 127/8, IPv6 ::1, IPv4-mapped IPv6
+  // whose embedded IPv4 is 127/8, and localhost/.localhost names (RFC 6761).
+  if(!host) return false;
+  let h=String(host).replace(/^\[|\]$/g,'').toLowerCase();
+  if(h.endsWith('.')) h=h.slice(0,-1);
+  if(h==='localhost'||h.endsWith('.localhost')) return true;
+  const ipv4=/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  if(ipv4){
+    const octets=ipv4.slice(1).map(Number);
+    return octets.every(o=>o>=0&&o<=255)&&octets[0]===127;
+  }
+  if(h.includes(':')){
+    const zone=h.indexOf('%');
+    if(zone!==-1) h=h.slice(0,zone);
+    if(h==='::1'||h==='0:0:0:0:0:0:0:1') return true;
+    const mapped=/^(?:::ffff:|0:0:0:0:0:ffff:)(.+)$/.exec(h);
+    if(mapped){
+      const tail=mapped[1];
+      const dotted=/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(tail);
+      if(dotted){
+        const octets=dotted.slice(1).map(Number);
+        return octets.every(o=>o>=0&&o<=255)&&octets[0]===127;
+      }
+      const hex=/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(tail);
+      if(hex) return (parseInt(hex[1],16)>>>8)===127;
+      return false;
+    }
+    return false;
+  }
+  return false;
+}
+
 function _dashboardIsBrowserLoopback(){
-  const host=(window.location.hostname||'').replace(/^\[|\]$/g,'').toLowerCase();
-  return host==='127.0.0.1'||host==='localhost'||host==='::1';
+  return _dashboardHostIsLoopback(window.location.hostname||'');
+}
+
+function _dashboardUrlIsLoopback(url){
+  if(!url) return false;
+  try{
+    return _dashboardHostIsLoopback(new URL(url).hostname);
+  }catch(_){return false;}
 }
 
 function _normalizeDashboardEnabledMode(mode){
@@ -1718,13 +1846,15 @@ function _syncNavActionMirrors(){
   const rail=document.querySelector('.rail');
   const sidebar=document.querySelector('.sidebar-nav');
   if(!rail||!sidebar)return;
+  const anchor=sidebar.querySelector('.dashboard-link,[data-dashboard-link]')||sidebar.querySelector('[data-panel="logs"]');
   const sources=Array.from(rail.querySelectorAll('.nav-tab:not([data-panel]):not([data-dashboard-link])')).filter(source=>source.id);
   const mirrors=Array.from(sidebar.querySelectorAll('[data-nav-action-mirror]'));
   const sourceIds=new Set(sources.map(source=>source.id));
   mirrors.forEach(mirror=>{
     if(!sourceIds.has(mirror.getAttribute('data-nav-action-mirror')))mirror.remove();
   });
-  sources.forEach(source=>{
+  let next=anchor||null;
+  sources.slice().reverse().forEach(source=>{
     const sourceVisible=(()=>{
       if(source.hidden||source.getAttribute('aria-hidden')==='true')return false;
       if(source.classList.contains('nav-tab-hidden'))return false;
@@ -1748,12 +1878,12 @@ function _syncNavActionMirrors(){
         if(mirror._navActionSource)mirror._navActionSource.click();
         if(typeof closeMobileSidebar==='function')closeMobileSidebar();
       });
-      const anchor=sidebar.querySelector('.dashboard-link,[data-dashboard-link]')||sidebar.querySelector('[data-panel="logs"]');
-      sidebar.insertBefore(mirror,anchor||null);
     }else{
       mirror.innerHTML=source.innerHTML;
       _stripInlineEventHandlers(mirror);
     }
+    if(mirror.parentNode!==sidebar||mirror.nextElementSibling!==next)sidebar.insertBefore(mirror,next);
+    next=mirror;
     mirror._navActionSource=source;
     mirror.classList.toggle('nav-action-visible',sourceVisible);
     const label=source.getAttribute('data-tooltip')||source.getAttribute('aria-label')||'';
@@ -1775,7 +1905,7 @@ else _initNavActionMirrors();
 function _applyDashboardStatus(status){
   const running=!!(status&&status.running);
   const url=running?_dashboardBrowserUrl(status):'';
-  const warning=running&&!_dashboardIsBrowserLoopback()?t('dashboard_loopback_warning'):'';
+  const warning=running&&!_dashboardIsBrowserLoopback()&&_dashboardUrlIsLoopback(url)?t('dashboard_loopback_warning'):'';
   document.querySelectorAll('[data-dashboard-link]').forEach(btn=>{
     btn.classList.toggle('dashboard-link-visible',running);
     btn.classList.toggle('nav-action-visible',running);
@@ -2528,6 +2658,37 @@ function _applyMediaPlaybackRate(media, rate=_getStoredMediaPlaybackRate()){
   media.playbackRate=rate;
   _syncMediaSpeedButtons(media.closest('.msg-media-editor,.preview-media-wrap'),rate);
 }
+let _mediaVisibilityObserver=null;
+function _promoteVisibleVideoPreload(video){
+  if(!video||!video.matches||!video.matches('.msg-media-video')) return;
+  if(video.isConnected===false) return;
+  if(video.dataset&&video.dataset.visiblePreload==='1') return;
+  if(video.dataset) video.dataset.visiblePreload='1';
+  video.preload='auto';
+  // Off-screen history stays metadata-only. Once a card approaches the
+  // viewport, restart just that resource so Chromium fills a playable buffer.
+  if(video.paused&&video.readyState<4&&typeof video.load==='function') video.load();
+}
+function _observeVideoPreload(video){
+  if(!video||!video.matches||!video.matches('.msg-media-video')) return;
+  if(video.dataset&&video.dataset.visiblePreload==='1') return;
+  if(_mediaVisibilityObserver) _mediaVisibilityObserver.observe(video);
+}
+function _unobserveVideoPreload(video){
+  if(!video||!_mediaVisibilityObserver) return;
+  _mediaVisibilityObserver.unobserve(video);
+}
+function _initMediaVisibilityObserver(){
+  if(_mediaVisibilityObserver||typeof IntersectionObserver==='undefined') return;
+  _mediaVisibilityObserver=new IntersectionObserver(entries=>{
+    for(const entry of entries){
+      if(!entry.isIntersecting) continue;
+      const video=entry.target;
+      _unobserveVideoPreload(video);
+      _promoteVisibleVideoPreload(video);
+    }
+  },{root:null,rootMargin:'300px 0px',threshold:0.01});
+}
 function _mediaKindForName(name=''){
   const clean=String(name||'').split('?')[0].toLowerCase();
   if(_VIDEO_EXTS.test(clean)) return 'video';
@@ -2694,21 +2855,40 @@ document.addEventListener("loadedmetadata", e=>{
     _applyMediaPlaybackRate(e.target);
   }
 },true);
+document.addEventListener('play',e=>{
+  if(e.target&&e.target.matches&&e.target.matches('.msg-media-video')){
+    _promoteVisibleVideoPreload(e.target);
+  }
+},true);
 function _initMediaPlaybackObserver(){
   if(!document.body||window._mediaPlaybackObserver) return;
+  _initMediaVisibilityObserver();
   window._mediaPlaybackObserver=new MutationObserver(records=>{
     for(const rec of records){
+      for(const node of rec.removedNodes||[]){
+        if(!node||node.nodeType!==1) continue;
+        const videos=[];
+        if(node.matches&&node.matches('.msg-media-video')) videos.push(node);
+        if(node.querySelectorAll) videos.push(...node.querySelectorAll('.msg-media-video'));
+        videos.forEach(_unobserveVideoPreload);
+      }
       for(const node of rec.addedNodes||[]){
         if(!node||node.nodeType!==1) continue;
         const media=[];
         if(node.matches&&node.matches('audio,video')) media.push(node);
         if(node.querySelectorAll) media.push(...node.querySelectorAll('audio,video'));
-        media.forEach(m=>_applyMediaPlaybackRate(m));
+        media.forEach(m=>{
+          _applyMediaPlaybackRate(m);
+          _observeVideoPreload(m);
+        });
       }
     }
   });
   window._mediaPlaybackObserver.observe(document.body,{childList:true,subtree:true});
-  document.querySelectorAll('audio,video').forEach(m=>_applyMediaPlaybackRate(m));
+  document.querySelectorAll('audio,video').forEach(m=>{
+    _applyMediaPlaybackRate(m);
+    _observeVideoPreload(m);
+  });
 }
 if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',_initMediaPlaybackObserver);
 else _initMediaPlaybackObserver();
@@ -3195,7 +3375,34 @@ function _findModelInDropdown(modelId, sel, preferredProviderId){
   }
   const preferred=String(preferredProviderId||explicitProvider||'').toLowerCase();
   if(preferred){
-    const providerMatch=options.find(o=>norm(o.value)===target && _getOptionProviderId(o).toLowerCase()===preferred);
+    if(preferred==='custom'||preferred.startsWith('custom:')){
+      // A slash is part of a custom endpoint's upstream model ID, not a
+      // provider namespace. Match the exact routed ID (allowing only the
+      // WebUI's @provider: wrapper and dash/dot spelling compatibility).
+      const routeNorm=value=>{
+        let routed=String(value||'');
+        const prefix=`@${preferred}:`;
+        if(routed.toLowerCase().startsWith(prefix)) routed=routed.slice(prefix.length);
+        return routed.toLowerCase().replace(/-/g,'.');
+      };
+      const providerOptions=options.filter(o=>_getOptionProviderId(o).toLowerCase()===preferred);
+      const providerMatch=providerOptions.find(o=>routeNorm(o.value)===routeNorm(rawModel));
+      if(providerMatch) return providerMatch.value;
+      // Legacy sessions may store only the bare suffix of a routed custom
+      // option. Preserve #6195's provider-hinted repair, but only for an
+      // explicit @provider: row; an unwrapped slash ID belongs to the active
+      // endpoint and must not substitute for a distinct bare model.
+      if(!rawModel.includes('/')&&!rawModel.startsWith('@')){
+        const prefix=`@${preferred}:`;
+        const suffixMatches=providerOptions.filter(o=>
+          String(o.value||'').toLowerCase().startsWith(prefix)
+          &&norm(o.value)===target
+        );
+        if(suffixMatches.length===1) return suffixMatches[0].value;
+      }
+      return null;
+    }
+    const providerMatch=options.find(o=>norm(o.value)===target&&_getOptionProviderId(o).toLowerCase()===preferred);
     if(providerMatch) return providerMatch.value;
   }
   // 2. Normalized match — but ONLY when unambiguous. If the bare id
@@ -4396,10 +4603,16 @@ function renderModelDropdown(){
     else if(_prevHasSearch){ for(const k in _groupOpenState) delete _groupOpenState[k]; }
     _prevHasSearch=hasSearch;
     const found=new Set();
+    // Fold whitespace/hyphens/dots on both sides so "ox alpha", "ox-alpha" and
+    // "ox.alpha" all match the same model (OpenRouter display names use spaces,
+    // ids use slashes/hyphens) (#7228).
+    const _foldModelSearch=(s)=>String(s||'').toLowerCase().replace(/[\s._-]+/g,'');
+    const foldTerm=_foldModelSearch(term);
     for(const m of _modelData){
       const name=m.name.toLowerCase();
       const id=m.id.toLowerCase();
-      if(name.includes(term)||id.includes(term)){
+      if(name.includes(term)||id.includes(term)
+         ||(foldTerm&&(_foldModelSearch(name).includes(foldTerm)||_foldModelSearch(id).includes(foldTerm)))){
         found.add(m.value);
       }
     }
@@ -4888,11 +5101,41 @@ function _fitComposerFooter(){
   if(!left) return;
   if(!left.clientWidth) return;
   const overflows=function(){return left.scrollWidth>left.clientWidth+1;};
-  footer.classList.remove('cf-icons','cf-burger');
-  if(!overflows()) return;
-  footer.classList.add('cf-icons');
-  if(!overflows()) return;
-  footer.classList.add('cf-burger');
+  // Measure without ever PAINTING the expanded state. Stripping the stage
+  // classes makes the footer briefly full-width, which grows the composer and
+  // shrinks #messages by a few px; restoring them a moment later shrinks it
+  // back. A pinned reader sees that as a vertical up/down jitter on every
+  // fit pass (and fit passes run on each context-indicator update during SSE).
+  // `visibility:hidden` + a fixed height freeze the layout box during the
+  // measurement, so the scroll container's clientHeight never changes.
+  const prevVisibility=footer.style.visibility;
+  const prevHeight=footer.style.height;
+  const frozenHeight=footer.getBoundingClientRect().height;
+  if(frozenHeight>0){
+    footer.style.height=frozenHeight+'px';
+    footer.style.visibility='hidden';
+  }
+  let next='';
+  try{
+    footer.classList.remove('cf-icons','cf-burger');
+    if(overflows()){
+      footer.classList.add('cf-icons');
+      next='cf-icons';
+      if(overflows()){
+        footer.classList.add('cf-burger');
+        next='cf-icons cf-burger';
+      }
+    }
+  }finally{
+    // Restore the measured stage, then release the frozen box in the same
+    // task so no intermediate geometry is ever committed to the screen.
+    footer.classList.toggle('cf-icons',next.includes('cf-icons'));
+    footer.classList.toggle('cf-burger',next.includes('cf-burger'));
+    if(frozenHeight>0){
+      footer.style.height=prevHeight;
+      footer.style.visibility=prevVisibility;
+    }
+  }
 }
 window._fitComposerFooter=_fitComposerFooter;
 
@@ -5687,6 +5930,96 @@ function _freshProgrammaticScrollActive(){
   return true;
 }
 function _deferClearProgrammaticScroll(ms){clearTimeout(_programmaticScrollResetTimer);_programmaticScrollResetTimer=setTimeout(()=>{_programmaticScroll=false;},ms||80);}
+let _messageJumpScrollGeneration=0;
+let _messageJumpScrollOwner=null;
+let _messageJumpScrollSettleTimer=0;
+function _messageJumpSessionId(){
+  if(typeof S!=='undefined'&&S.session&&S.session.session_id) return String(S.session.session_id);
+  return '';
+}
+function _scheduleMessageJumpScrollReconcile(generation,ms){
+  if(!_messageJumpScrollOwner||_messageJumpScrollOwner.generation!==generation) return;
+  clearTimeout(_messageJumpScrollSettleTimer);
+  _messageJumpScrollSettleTimer=setTimeout(()=>_finishMessageJumpScroll(generation),ms||220);
+}
+function _beginMessageJumpScroll(container){
+  const previous=_messageJumpScrollOwner;
+  const preserved=previous?previous.preserved:{
+    scrollPinned:_scrollPinned,
+    messageUserUnpinned:_messageUserUnpinned,
+    nearBottomCount:_nearBottomCount,
+  };
+  clearTimeout(_messageJumpScrollSettleTimer);
+  const generation=++_messageJumpScrollGeneration;
+  _messageJumpScrollOwner={generation,container,sessionId:_messageJumpSessionId(),preserved};
+  // While the jump owner is active, temporarily release the reader pin so a
+  // live token arriving between smooth-scroll frames cannot let scrollIfPinned()
+  // reclaim the bottom and snap the reader off the jump target (#6621). The
+  // preserved snapshot above is what _finishMessageJumpScroll() reconciles
+  // against once the jump settles.
+  _scrollPinned=false;
+  _messageUserUnpinned=true;
+  _nearBottomCount=0;
+  _programmaticScroll=true;
+  _programmaticScrollSetAt=performance.now();
+  _scheduleMessageJumpScrollReconcile(generation,300);
+  return generation;
+}
+function _finishMessageJumpScroll(generation){
+  const owner=_messageJumpScrollOwner;
+  if(!owner||owner.generation!==generation) return;
+  if(owner.sessionId!==_messageJumpSessionId()){
+    _cancelMessageJumpScroll();
+    return;
+  }
+  clearTimeout(_messageJumpScrollSettleTimer);
+  _messageJumpScrollSettleTimer=0;
+  const container=owner.container;
+  const maxTop=Math.max(0,container.scrollHeight-container.clientHeight);
+  const top=Math.max(0,Math.min(Number(container.scrollTop)||0,maxTop));
+  const bottomDistance=maxTop-top;
+  if(bottomDistance>80){
+    _scrollPinned=false;
+    _messageUserUnpinned=true;
+    _nearBottomCount=0;
+  }else{
+    _scrollPinned=owner.preserved.scrollPinned;
+    _messageUserUnpinned=owner.preserved.messageUserUnpinned;
+    _nearBottomCount=owner.preserved.nearBottomCount;
+  }
+  _lastScrollTop=container.scrollTop;
+  _lastMessageClientHeight=container.clientHeight;
+  _messageJumpScrollOwner=null;
+  _programmaticScroll=false;
+  if(typeof _syncScrollToBottomCue==='function'){
+    _syncScrollToBottomCue(!_scrollPinned&&bottomDistance>80,{newMessage:_newMessageCueVisible});
+  }
+  if(typeof _updateSessionStartJumpButton==='function') _updateSessionStartJumpButton();
+  // An external-session refresh deferred while the reader was temporarily
+  // unpinned for the jump window (#6621) would otherwise stay stranded once the
+  // near-tail reconciliation restores follow mode. Flush it when the terminal
+  // state is genuinely pinned to the tail.
+  if(_scrollPinned&&!_messageUserUnpinned&&typeof _flushDeferredActiveSessionExternalRefresh==='function'){
+    _flushDeferredActiveSessionExternalRefresh();
+  }
+}
+function _cancelMessageJumpScroll(){
+  ++_messageJumpScrollGeneration;
+  clearTimeout(_messageJumpScrollSettleTimer);
+  _messageJumpScrollSettleTimer=0;
+  // _beginMessageJumpScroll temporarily unpins the reader for the ownership
+  // window (#6621); a cancel that isn't a reconcile must put the pre-jump pin
+  // state back, or the transient unpinned state would leak. Callers that want a
+  // different terminal pin state (e.g. scrollToBottom) set it right after this.
+  const owner=_messageJumpScrollOwner;
+  if(owner&&owner.preserved){
+    _scrollPinned=owner.preserved.scrollPinned;
+    _messageUserUnpinned=owner.preserved.messageUserUnpinned;
+    _nearBottomCount=owner.preserved.nearBottomCount;
+  }
+  _messageJumpScrollOwner=null;
+  _programmaticScroll=false;
+}
 let _nearBottomCount=0;
 let _lastScrollTop=null;
 let _lastMessageClientHeight=null;   // #4702: track scroller height to ignore iOS portrait toolbar-settle reflows (a clientHeight increase fires a scroll event with decreased scrollTop that is NOT a user scroll)
@@ -5732,7 +6065,7 @@ let _lastMessageRenderAt=-Infinity;
 function _recentMessageRenderArtifactWindow(ms){
   return performance.now()-_lastMessageRenderAt<(ms||1400);
 }
-function _cancelBottomSettle(){ _bottomSettleToken++; if(_settleRO){ _settleRO.disconnect(); _settleRO=null; } clearTimeout(_settleTimer); clearTimeout(_settleFinalTimer); cancelAnimationFrame(_settleRAF); }
+function _cancelBottomSettle(){ _cancelMessageJumpScroll(); _bottomSettleToken++; if(_settleRO){ _settleRO.disconnect(); _settleRO=null; } clearTimeout(_settleTimer); clearTimeout(_settleFinalTimer); cancelAnimationFrame(_settleRAF); }
 function _markMessageTouchScrollIntent(active=true){
   _messageTouchScrollActive=!!active;
   _lastMessageTouchScrollIntentMs=performance.now();
@@ -5785,15 +6118,33 @@ function _recordNonMessageScrollIntent(e){
   const target=e&&e.target;
   if(!el||!target) return;
   if(!el.contains(target)){ _lastNonMessageScrollIntentMs=performance.now(); return; }
+  // Capture the guards before cancelling the active owner: cancellation clears
+  // the programmatic flag and jump owner, but a low-delta upward wheel must still
+  // count as reader takeover when it interrupted an owned scroll.
+  const wheelUp=typeof e.deltaY==='number'&&e.deltaY<0;
+  const guardedWheelUp=wheelUp&&_freshProgrammaticScrollActive();
+  const jumpScrollOwned=typeof _messageJumpScrollOwner!=='undefined'&&!!_messageJumpScrollOwner;
   if(e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY!==0)){
     if(typeof _messageScrollInputGeneration==='number') _messageScrollInputGeneration++;
+    if(jumpScrollOwned||e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY< -30)||guardedWheelUp){
+      if(typeof _cancelBottomSettle==='function') _cancelBottomSettle();
+    }
+  }
+  // Any message-pane scroll input that interrupts an active jump owner is a
+  // reader takeover, regardless of direction or the programmatic-latch age
+  // (#6621): _cancelBottomSettle above restores the pre-jump snapshot, so
+  // without this a gentle wheel-up OR wheel-down (or a touch scroll) after the
+  // latch expires would leave the reader pinned and let the next token snap to
+  // the bottom. Establish the unpinned reader-owned state explicitly; a reader
+  // who wants the bottom re-pins by reaching it (<=80px) or pressing End.
+  if(jumpScrollOwned&&(wheelUp||e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY!==0))){
+    _messageUserUnpinned=true;
+    _scrollPinned=false;
+    _nearBottomCount=0;
   }
   if(typeof e.deltaY==='number'&&e.deltaY<0) _lastMessageWheelIntentMs=performance.now();
   // Keep e.deltaY< -30 as the ordinary direct sticky-unpin threshold.
-  const wheelUp=typeof e.deltaY==='number'&&e.deltaY<0;
-  const guardedWheelUp=wheelUp&&_freshProgrammaticScrollActive();
   if(e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY< -30)||guardedWheelUp){
-    _cancelBottomSettle();
     if(e.type==='touchmove') _markMessageTouchScrollIntent(true);
     if((typeof e.deltaY==='number'&&e.deltaY< -30)||guardedWheelUp){
       _messageUserUnpinned=true;
@@ -5885,6 +6236,7 @@ if(typeof document!=='undefined'){
 // prevent the new chat's first scroll comparing against the previous chat's
 // scrollTop (Opus stage-302 SHOULD-FIX, #1731 follow-up).
 function _resetScrollDirectionTracker(){
+  _cancelMessageJumpScroll();
   _clearNewMessageScrollCue();
   _lastScrollTop=null;
   _lastMessageClientHeight=null;
@@ -5906,6 +6258,11 @@ function _resetScrollDirectionTracker(){
   _deferredOlderMessagesTimer=0;
 }
 function _resetStreamScrollFollow(){
+  // Cancel any in-flight jump owner FIRST: a new stream is a definitive
+  // pin-to-follow, and _cancelMessageJumpScroll() restores the pre-jump snapshot
+  // (#6621), so it must run BEFORE the pinned-state assignments below or it would
+  // undo them and silently disable auto-follow for the new stream.
+  _cancelBottomSettle();
   _clearNewMessageScrollCue();
   _messageUserUnpinned=false;
   _scrollPinned=true;
@@ -5918,7 +6275,6 @@ function _resetStreamScrollFollow(){
   _lastMessageScrollIntentMs=-Infinity;
   // #4970 review (greptile P1): same hygiene for keyboard scroll intent.
   _lastMessageKeyScrollIntentMs=-Infinity;
-  _cancelBottomSettle();
 }
 if(typeof window!=='undefined'){
   window._resetScrollDirectionTracker=_resetScrollDirectionTracker;
@@ -5998,6 +6354,7 @@ if(typeof window!=='undefined'){
   if(!el) return;
   el.addEventListener('pointerdown',(e)=>{
     if(e.target===el&&e.offsetX>=el.clientWidth){
+      if(typeof _cancelBottomSettle==='function') _cancelBottomSettle();
       _scrollbarDragActive=true;
       if(typeof _messageScrollInputGeneration==='number') _messageScrollInputGeneration++;
     }
@@ -6045,6 +6402,7 @@ if(typeof window!=='undefined'){
     // Count only when the message pane itself is the scroll target: it is focused,
     // contains the focus, or the pointer is over it (keyboard scroll w/o focus).
     if(a===el||el.contains(a)||el.matches(':hover')){
+      if(typeof _cancelBottomSettle==='function') _cancelBottomSettle();
       const now=performance.now();
       if(typeof _messageScrollInputGeneration==='number') _messageScrollInputGeneration++;
       _lastMessageKeyScrollIntentMs=now;
@@ -6054,8 +6412,12 @@ if(typeof window!=='undefined'){
   },{capture:true,passive:true});
   let _scrollRaf=0;
   el.addEventListener('scroll',()=>{
-    _scheduleMessageVirtualizedRender();
+    if(_messageJumpScrollOwner){
+      _scheduleMessageJumpScrollReconcile(_messageJumpScrollOwner.generation);
+      return;
+    }
     if(_freshProgrammaticScrollActive()) return;
+    _scheduleMessageVirtualizedRender();
     _markMessageVirtualScrollActive();
     cancelAnimationFrame(_scrollRaf);
     _scrollRaf=requestAnimationFrame(()=>{
@@ -6105,7 +6467,18 @@ if(typeof window!=='undefined'){
         return;
       }
       _lastScrollTop=top;
-      if(movedUp){
+      if(movedUp&&bottomDistance>1){
+        // Only a real scroll-away unpins. A collapse ABOVE the tail (worklog
+        // "Done" fold, thinking/tool card collapse, interim-note collapse) shrinks
+        // scrollHeight while the reader is still flush at the tail, so the browser
+        // clamps scrollTop DOWN by the collapsed height and fires a scroll event:
+        // movedUp is true while bottomDistance stays ~0. Reading that as user
+        // intent killed live-follow mid-stream on a reader who never scrolled.
+        // The render-artifact suppression below cannot cover it: it needs a
+        // renderMessages() within the last 1400ms, and the collapse paths above run
+        // from the streaming handlers, which update the DOM incrementally and never
+        // stamp _lastMessageRenderAt. A genuine upward scroll always leaves the true
+        // bottom first, so it still has bottomDistance>1 here.
         _cancelBottomSettle();
         _nearBottomCount=0;
         _scrollPinned=false;
@@ -6913,6 +7286,11 @@ function _settleFinalScroll(token){
 }
 function scrollIfPinned(){
   if(!window._autoScrollFollow) return;
+  // A jump-to-question owner is mid-flight: it deliberately holds the reader at
+  // the jump target across smooth-scroll frames, so never let a live token
+  // reclaim the bottom while it is active (#6621). _finishMessageJumpScroll()
+  // reconciles the pin state once the jump settles.
+  if(typeof _messageJumpScrollOwner!=='undefined'&&_messageJumpScrollOwner) return;
   if(_messageUserUnpinned){
     // Only scrollToBottom() cleared this flag, so one scroll-up permanently
     // killed auto-follow. Re-pin ONLY when the reader has genuinely returned to
@@ -6937,6 +7315,13 @@ function scrollIfPinned(){
   _settleMessageScrollToBottom(false);
 }
 function scrollToBottom(){
+  // An explicit scroll-to-bottom (End button, or any definitive pin-to-bottom)
+  // supersedes a pending jump-to-question reconciliation: cancel the active jump
+  // owner first so its deferred _finishMessageJumpScroll() can't restore the
+  // pre-jump unpinned snapshot and silently undo this pin (#6621). The jump path
+  // itself never calls scrollToBottom(), and while a jump owner is active the
+  // reader is unpinned so the internal auto-follow callers don't reach here.
+  if(typeof _messageJumpScrollOwner!=='undefined'&&_messageJumpScrollOwner&&typeof _cancelMessageJumpScroll==='function') _cancelMessageJumpScroll();
   _clearNewMessageScrollCue();
   _scrollPinned=true;
   _messageUserUnpinned=false;
@@ -6969,21 +7354,93 @@ function _fmtOllamaLabel(mid){
   return label;
 }
 
+// Bedrock cross-region inference routing heads. `global` belongs here too: the
+// catalog in api/config.py ships six `global.anthropic.claude-*` IDs and the
+// first-party routing notes treat that as the canonical Bedrock shape. Keep this
+// set byte-identical to _regions in api/config.py — backend catalog labels and
+// runtime picker fallback labels diverge otherwise.
+const _BEDROCK_REGION_PREFIXES = new Set(['us', 'eu', 'apac', 'global', 'us-gov']);
+// Vendor namespaces Bedrock/Vertex put in front of the real model id.
+const _DOTTED_VENDOR_PREFIXES = new Set([
+  'anthropic', 'amazon', 'meta', 'mistral', 'cohere', 'ai21',
+  'stability', 'writer', 'deepseek', 'qwen', 'openai', 'google',
+  // Bedrock foundation-model vendors added after the first pass. Without these,
+  // real IDs rendered with the namespace intact ("Us.luma.ray 2",
+  // "Twelvelabs.marengo Embed 2 7", "Ibm.granite 3 8B Instruct").
+  'luma', 'twelvelabs', 'ibm', 'nvidia', 'snowflake',
+]);
+/** Drop a Bedrock/Vertex dotted routing+vendor prefix from a model id.
+ *
+ *  Only the documented shapes are stripped — `<region>.<vendor>.<model>` and
+ *  `<vendor>.<model>` — plus a trailing `:<n>` provisioned-revision suffix.
+ *  Anything else is returned unchanged, so `deepseek.v3`, `foo.bar.baz` and the
+ *  version dot in `gpt-4.1` are never rewritten.
+ *
+ *  Mirrors _strip_dotted_provider_prefix() in api/config.py. */
+function _stripDottedModelPrefix(bare){
+  const value = String(bare || '');
+  if (!value || !value.includes('.') || value.includes('://') || value.startsWith('@')) return value;
+  const segs = value.split('.');
+  let i = 0;
+  if (segs.length - i >= 3 && _BEDROCK_REGION_PREFIXES.has((segs[i] || '').toLowerCase())
+      && _DOTTED_VENDOR_PREFIXES.has((segs[i + 1] || '').toLowerCase())) i++;
+  if (segs.length - i >= 2 && _DOTTED_VENDOR_PREFIXES.has((segs[i] || '').toLowerCase())) {
+    // Dropping the vendor is only safe when what remains still names the model.
+    // A bare version remainder (`deepseek.v3`) means the vendor WAS the name.
+    const remainder = segs.slice(i + 1).join('.');
+    if (!/^v?\d+(?:[.\-]\d+)*$/i.test(remainder)) i++;
+  }
+  if (i === 0) return value;
+  return segs.slice(i).join('.').replace(/:\d+$/, '');
+}
 function getModelLabel(modelId){
   if(!modelId) return 'Unknown';
   const rawId=String(modelId||'');
-  // Preserve custom gateway model IDs exactly as configured.
+  // The catalog is the authority on model identity: the backend knows the real
+  // provider/model split and ships an exact `m.label` per routing id, so a
+  // catalogued id — including a plain-lane `@custom:` id whose model contains
+  // colons (`@custom:ollamacloud/qwen3.5:397b`) — renders verbatim. The
+  // string parsing below is only a legacy fallback for ids the catalog has
+  // never seen (pre-hydration, stale sessions, removed providers), where a
+  // first-colon split alone cannot tell a `@custom:<slug>:<model>` from a
+  // plain-lane `@custom:<model-with-colon>` (#7240).
+  if(_dynamicModelLabels[modelId]) return _dynamicModelLabels[modelId];
+  // Preserve custom gateway model IDs exactly as configured. A custom id is
+  // `@custom:<model>` in the plain custom lane or `@custom:<slug>:<model>` for
+  // a named custom provider; the provider slug may itself be an endpoint
+  // authority (e.g. `custom:10.8.71.41:8080`). The model portion may contain
+  // colons (tag/variant suffixes like `:free`, `:31b`, `:397b`) and vendor
+  // slashes, so only the leading provider segment is peeled (#7240).
   // Examples:
-  //   @custom:ai_gateway:Qwen3.6-35B-A3B -> Qwen3.6-35B-A3B
-  //   @custom:qwen397b-64k               -> qwen397b-64k
+  //   @custom:ai_gateway:Qwen3.6-35B-A3B            -> Qwen3.6-35B-A3B
+  //   @custom:omni:kg/stepfun/step-3.7-flash:free    -> kg/stepfun/step-3.7-flash:free
+  //   @custom:qwen397b-64k                           -> qwen397b-64k
   if(rawId.startsWith('@custom:')){
     const rest=rawId.slice('@custom:'.length);
-    if(rest.includes(':')) return rest.slice(rest.lastIndexOf(':')+1)||rawId;
-    if(rest.includes('/')) return rest.slice(rest.indexOf('/')+1)||rawId;
-    return rest||rawId;
+    const sep=rest.indexOf(':');
+    if(sep<0) return rest||rawId;
+    // A provider slug is a config key or a host:port authority — it never
+    // contains a `/`. A slash-bearing first segment is therefore the model
+    // itself in the plain custom lane (`@custom:ollamacloud/qwen3.5:397b`
+    // must render the whole remainder, not just `397b`), mirroring the
+    // `/`-means-routable rule api/config.py applies when building ids.
+    if(rest.slice(0,sep).includes('/')) return rest||rawId;
+    let model=rest.slice(sep+1);
+    // Endpoint-style slug (`custom:10.8.71.41:8080:model`): the `:port` belongs
+    // to the provider segment, mirroring the host:port slug check in
+    // api/config.py, so it is consumed before the model label starts.
+    const portMatch=/^(\d{1,5}):/.exec(model);
+    if(portMatch){
+      const port=Number(portMatch[1]);
+      if(port>=1&&port<=65535){
+        const host=rest.slice(0,sep).toLowerCase();
+        if(host==='localhost'||host.includes('.')||/^\d{1,3}(\.\d{1,3}){3}$/.test(host)){
+          model=model.slice(portMatch[0].length);
+        }
+      }
+    }
+    return model||rawId;
   }
-  // Check dynamic labels first, then fall back to splitting the ID
-  if(_dynamicModelLabels[modelId]) return _dynamicModelLabels[modelId];
   // Static fallback for common models
   const STATIC_LABELS={'openai/gpt-5.4-mini':'GPT-5.4 Mini','openai/gpt-4o':'GPT-4o','openai/o3':'o3','openai/o4-mini':'o4-mini','anthropic/claude-sonnet-4.6':'Sonnet 4.6','anthropic/claude-sonnet-4-5':'Sonnet 4.5','anthropic/claude-haiku-3-5':'Haiku 3.5','google/gemini-3.1-pro-preview':'Gemini 3.1 Pro','google/gemini-3-flash-preview':'Gemini 3 Flash','google/gemini-3.1-flash-lite-preview':'Gemini 3.1 Flash Lite','google/gemini-2.5-pro':'Gemini 2.5 Pro','google/gemini-2.5-flash':'Gemini 2.5 Flash','deepseek/deepseek-v4-flash':'DeepSeek V4 Flash','deepseek/deepseek-v4-pro':'DeepSeek V4 Pro','deepseek/deepseek-chat-v3-0324':'DeepSeek V3 (legacy)','meta-llama/llama-4-scout':'Llama 4 Scout'};
   if(STATIC_LABELS[modelId]) return STATIC_LABELS[modelId];
@@ -7030,6 +7487,41 @@ function getModelLabel(modelId){
   }
   // Strip @provider: prefix if present (e.g. @ollama-cloud:kimi-k2.6)
   if (_last.startsWith('@') && _last.includes(':')) _last = _last.split(':').slice(1).join(':');
+  // Bedrock/Vertex ids carry a dotted region + vendor prefix and sometimes a
+  // trailing `:<n>` version — `us.anthropic.claude-opus-5`,
+  // `us.anthropic.claude-sonnet-4-5-20250929-v1:0`. Left intact, the dotted head
+  // survives into the label as raw plumbing ("Us.anthropic.claude Opus 5" in the
+  // turn footer).
+  //
+  // Only the documented `<region>.<vendor>.<model>` / `<vendor>.<model>` shapes
+  // are stripped, via a CLOSED allow-list. A generic "drop leading letters-only
+  // dot segments" loop rewrites any uncatalogued id — `deepseek.v3` became "V3"
+  // and `foo.bar.baz` became "BAZ". Kept in lockstep with
+  // _strip_dotted_provider_prefix() in api/config.py; the paired test
+  // tests/test_dotted_model_label.py asserts both agree.
+  const _stripped = _stripDottedModelPrefix(_last);
+  if (_stripped !== _last) {
+    _last = _stripped;
+    // The normalized id is what the label tables are keyed on, so retry them —
+    // `us.anthropic.claude-sonnet-4-5` should land on the same "Sonnet 4.5" as
+    // `anthropic/claude-sonnet-4-5` rather than falling through to the raw id.
+    if (_dynamicModelLabels[_last]) return _dynamicModelLabels[_last];
+    if (STATIC_LABELS[_last]) return STATIC_LABELS[_last];
+    if (STATIC_LABELS['anthropic/' + _last]) return STATIC_LABELS['anthropic/' + _last];
+    // No table entry: prettify the Claude family the way the tables do — drop
+    // the `claude-` vendor word, the `-YYYYMMDD` date-pin and `-v1` revision
+    // (snapshot noise, not a name), then title-case. Bedrock is the only
+    // dotted-prefix source here, so this stays scoped to that path.
+    if (/^claude-/i.test(_last)) {
+      _last = _last
+        .replace(/^claude-/i, '')
+        .replace(/-v\d+$/i, '')
+        .replace(/-\d{8}$/, '')
+        .replace(/-/g, ' ')
+        .replace(/\b\w/g, c => c.toUpperCase())
+        .trim();
+    }
+  }
   const looksLikeOllamaTag = /^[a-z0-9][\w.-]*:[\w.-]+$/i.test(_last);
   const atProvider=(rawId.startsWith('@')&&rawId.includes(':'))
     ? rawId.slice(1,rawId.indexOf(':')).toLowerCase()
@@ -7115,7 +7607,7 @@ function _stripXmlToolCallsDisplay(s){
   s=s.replace(/<(?:\s*｜\s*DSML\s*[｜|]\s*)?function_calls(?:>|$)[\s\S]*$/i,'');
   // Remove malformed DSML tag fragments like "<｜DSML |" that can leak in tokens.
   s=s.replace(/<\s*｜\s*DSML\s*[｜|]\s*/gi,'');
-  return s.trim();
+  return s.replace(/^\s+/, '');
 }
 
 function _sanitizeThinkingDisplayText(text){
@@ -7325,10 +7817,43 @@ function renderMd(raw){
   });
   s=s.replace(/<strong>([\s\S]*?)<\/strong>/gi,(_,t)=>'**'+t+'**');
   s=s.replace(/<b>([\s\S]*?)<\/b>/gi,(_,t)=>'**'+t+'**');
-  s=s.replace(/<em>([\s\S]*?)<\/em>/gi,(_,t)=>'*'+t+'*');
-  s=s.replace(/<i>([\s\S]*?)<\/i>/gi,(_,t)=>'*'+t+'*');
+  // Keep boundary whitespace OUTSIDE the generated *...* delimiters: the inline
+  // emphasis regex below deliberately rejects a leading/trailing space (so
+  // `a * b * c` is not italicised), and `<em> x </em>` would otherwise degrade
+  // into literal asterisks (or a bullet list at line start).
+  const _emphasis=(t)=>{
+    const m=String(t).match(/^(\s*)([\s\S]*?)(\s*)$/);
+    return (m && m[2]) ? m[1]+'*'+m[2]+'*'+m[3] : t;
+  };
+  s=s.replace(/<em>([\s\S]*?)<\/em>/gi,(_,t)=>_emphasis(t));
+  s=s.replace(/<i>([\s\S]*?)<\/i>/gi,(_,t)=>_emphasis(t));
   s=s.replace(/<code>([^<]*?)<\/code>/gi,(_,t)=>'`'+t+'`');
-  s=s.replace(/<br\s*\/?>/gi,'\n');
+  // Convert <br> to a newline, EXCEPT inside genuine markdown table rows — there a
+  // newline would split the row and destroy the table. No sentinel token is used on
+  // purpose: any fixed placeholder is attacker-suppliable in message text and would be
+  // rewritten on the way out.
+  // The "is this a table row" test must match the DOWNSTREAM table parser's grammar
+  // exactly (a run of pipe-lines whose SECOND line is a separator). A looser per-line
+  // test would treat pipe-wrapped prose like `| note<br># heading |` as a table row and
+  // silently strip its heading/list rendering.
+  {
+    const _rowRe=/^ {0,3}\|.+\|[ \t]*$/;
+    const _sepRe=/^\|[\s|:-]+\|$/;
+    const _lines=s.split('\n');
+    const _isTableRow=new Array(_lines.length).fill(false);
+    for(let i=0;i<_lines.length;){
+      if(!_rowRe.test(_lines[i])){ i++; continue; }
+      let j=i;
+      while(j<_lines.length && _rowRe.test(_lines[j])) j++;
+      // A block qualifies only if the parser would accept it: >=2 rows and a separator
+      // in the second position.
+      if(j-i>=2 && _sepRe.test(_lines[i+1].trim())){
+        for(let k=i;k<j;k++) _isTableRow[k]=true;
+      }
+      i=j;
+    }
+    s=_lines.map((line,i)=>_isTableRow[i]?line:line.replace(/<br\s*\/?>/gi,'\n')).join('\n');
+  }
   // ── Glued-bold-heading lift (issue #1446) ────────────────────────────────
   // LLMs in thinking/reasoning mode frequently emit a "section header" glued
   // to the end of the previous paragraph with no whitespace, like:
@@ -7366,7 +7891,7 @@ function renderMd(raw){
     t=t.replace(/`([^`\n]+)`/g,(_,x)=>{_code_stash.push(`<code>${esc(x)}</code>`);return `\x00C${_code_stash.length-1}\x00`;});
     t=t.replace(/\*\*\*(.+?)\*\*\*/g,(_,x)=>`<strong><em>${esc(x)}</em></strong>`);
     t=t.replace(/\*\*(.+?)\*\*/g,(_,x)=>`<strong>${esc(x)}</strong>`);
-    t=t.replace(/\*([^*\n]+)\*/g,(_,x)=>`<em>${esc(x)}</em>`);
+    t=t.replace(/\*([^\s*](?:[^*\n]*?[^\s*])?)\*/g,(_,x)=>`<em>${esc(x)}</em>`);
     // Strikethrough: ~~text~~ → <del>text</del>
     t=t.replace(/~~(.+?)~~/g,(_,x)=>`<del>${esc(x)}</del>`);
     // #487: Image pass — runs while code stash is active so ![x](url) inside
@@ -7381,12 +7906,12 @@ function renderMd(raw){
     // Stash [label](url) links before autolink so the URL in href= is not re-linked
     const _link_stash=[];
     t=t.replace(/\[([^\]]+)\]\(((?:https?:\/\/|file:\/\/|workspace:\/\/|session:\/\/|mailto:|tel:|message:)[^\s\)]+)\)/g,(_,lb,u)=>{_link_stash.push(_markdownAnchor(lb,u));return `\x00L${_link_stash.length-1}\x00`;});
-    t=t.replace(/(https?:\/\/[^\s<>"')\]]+)/g,(url)=>{const trail=url.match(/[.,;:!?)]$/)?url.slice(-1):'';const clean=trail?url.slice(0,-1):url;return `<a href="${clean}" target="_blank" rel="noopener">${esc(clean)}</a>${trail}`;});
+    t=t.replace(/(https?:\/\/[^\s<>"')\]\uFF09]+)/g,(url)=>{const trail=url.match(/[.,;:!?)\uFF09\uFF0C\uFF1B\uFF1A\uFF01\uFF1F\u3001\u3002]$/)?url.slice(-1):'';const clean=trail?url.slice(0,-1):url;return `<a href="${clean}" target="_blank" rel="noopener">${esc(clean)}</a>${trail}`;});
     t=t.replace(/\x00L(\d+)\x00/g,(_,i)=>_link_stash[+i]);
     t=t.replace(/\x00G(\d+)\x00/g,(_,i)=>_img_stash[+i]);
     // Escape any plain text that isn't already wrapped in a tag we produced
     // by escaping bare < > that are not part of our own tags
-    const SAFE_INLINE=/^<\/?(strong|em|del|code|a|img)([\s>]|$)/i;
+    const SAFE_INLINE=/^<\/?(strong|em|del|code|a|img|br)([\s>]|$)/i;
     t=t.replace(/<\/?[a-z][^>]*>/gi,tag=>SAFE_INLINE.test(tag)?tag:esc(tag));
     return t;
   }
@@ -7396,55 +7921,104 @@ function renderMd(raw){
   s=s.replace(/(<code\b[^>]*>[\s\S]*?<\/code>)/g,m=>{_ob_stash.push(m);return `\x00O${_ob_stash.length-1}\x00`;});
   s=s.replace(/\*\*\*(.+?)\*\*\*/g,(_,t)=>`<strong><em>${esc(t)}</em></strong>`);
   s=s.replace(/\*\*(.+?)\*\*/g,(_,t)=>`<strong>${esc(t)}</strong>`);
-  s=s.replace(/\*([^*\n]+)\*/g,(_,t)=>`<em>${esc(t)}</em>`);
+  s=s.replace(/\*([^\s*](?:[^*\n]*?[^\s*])?)\*/g,(_,t)=>`<em>${esc(t)}</em>`);
   s=s.replace(/~~(.+?)~~/g,(_,t)=>`<del>${esc(t)}</del>`);
   s=s.replace(/\x00O(\d+)\x00/g,(_,i)=>_ob_stash[+i]);
   s=s.replace(/^###### (.+)$/gm,(_,t)=>`<h6>${inlineMd(t)}</h6>`).replace(/^##### (.+)$/gm,(_,t)=>`<h5>${inlineMd(t)}</h5>`).replace(/^#### (.+)$/gm,(_,t)=>`<h4>${inlineMd(t)}</h4>`).replace(/^### (.+)$/gm,(_,t)=>`<h3>${inlineMd(t)}</h3>`).replace(/^## (.+)$/gm,(_,t)=>`<h2>${inlineMd(t)}</h2>`).replace(/^# (.+)$/gm,(_,t)=>`<h1>${inlineMd(t)}</h1>`);
   s=s.replace(/^---+$/gm,'<hr>');
   // (Blockquotes are handled by the pre-pass at the top of renderMd, before
   // fence_stash. The per-line passes below never see > prefixes.)
-  function _renderListBlock(lines, ordered){
-    const marker=ordered?'\\d+\\. ':'[-*+] ';
-    let html=ordered?'<ol>':'<ul>';
-    let item=null;
-    const flush=()=>{
-      if(!item) return;
-      const body=item.parts.join('\n').trim();
-      const text=body;
-      let inner;
-      if(!ordered && /^\[x\] /i.test(text)) inner='<span class="task-done">✅</span> '+inlineMd(text.slice(4));
-      else if(!ordered && /^\[ \] /.test(text)) inner='<span class="task-todo">☐</span> '+inlineMd(text.slice(4));
-      else inner=inlineMd(text);
-      const valueAttr=item.value!==null?` value="${item.value}"`:'';
-      const styleAttr=item.indent?` style="margin-left:16px"`:'';
-      html+=`<li${valueAttr}${styleAttr}>${inner}</li>`;
-      item=null;
+  function _renderListBlock(lines){
+    // Single-pass mixed-marker list renderer (#6700). Builds a real nested
+    // <ul>/<ol> tree with a stack keyed by indentation depth + marker kind
+    // instead of rendering one marker family and re-parsing the generated
+    // HTML with the other. Only item text goes through inlineMd(); tags
+    // emitted here are never parsed as Markdown again.
+    const root={ordered:false,items:[]};   // container for top-level lists
+    const listStack=[];                    // listStack[k]: list open at depth k
+    const itemStack=[];                    // itemStack[k]: last item at depth k
+    const openList=(depth,ordered)=>{
+      const ln={ordered,items:[]};
+      // Attach to the nearest open ancestor item when indentation jumps by
+      // more than one level (e.g. 4-space indent straight from the top), so
+      // the new list nests under the right parent instead of detaching.
+      let parentItem=null;
+      for(let k=depth-1;k>=0;k--){
+        if(itemStack[k]){ parentItem=itemStack[k]; break; }
+      }
+      (parentItem?parentItem.sublists:root.items).push(ln);
+      listStack[depth]=ln;
+      return ln;
+    };
+    const openItem=(depth,ordered,value,content)=>{
+      for(let k=listStack.length-1;k>depth;k--) listStack.pop();
+      if(!listStack[depth]||listStack[depth].ordered!==ordered){
+        if(listStack[depth]) listStack.pop();
+        listStack[depth]=openList(depth,ordered);
+      }
+      const item={ordered,value,content:[content],sublists:[]};
+      listStack[depth].items.push(item);
+      itemStack[depth]=item;
+      for(let k=itemStack.length-1;k>depth;k--) itemStack.pop();
+      return item;
     };
     for(const raw of lines){
       const line=String(raw||'');
-      const nested=line.match(new RegExp(`^ {2,}(${marker})(.*)$`));
-      if(nested){
-        flush();
-        item={indent:true,value:ordered?parseInt(nested[1],10):null,parts:[nested[2]]};
-        continue;
+      const om=line.match(/^(\s*)(\d+)\.\s+(.*)$/);
+      const um=line.match(/^(\s*)([-*+])\s+(.*)$/);
+      const m=om||um;
+      if(m){
+        const depth=m[1].length<2?0:Math.floor(m[1].length/2);
+        openItem(depth,!!om,om?parseInt(om[2],10):null,m[3]);
+      } else if(itemStack.length){
+        itemStack[itemStack.length-1].content.push(line.replace(/^ {2,}/,'').trim());
       }
-      const top=line.match(new RegExp(`^(?:  )?(${marker})(.*)$`));
-      if(top){
-        flush();
-        item={indent:false,value:ordered?parseInt(top[1],10):null,parts:[top[2]]};
-        continue;
-      }
-      if(!item) continue;
-      item.parts.push(line.replace(/^ {2,}/,'').trim());
     }
-    flush();
-    return html+(ordered?'</ol>':'</ul>');
+    // Iterative depth-first emit (#6700 re-gate). The recursive
+    // renderList/renderItem pair recursed once per nesting level, so a
+    // pathologically deep list (an agent dumping deeply nested structured
+    // data) threw RangeError at ~2,000 levels; renderMd() runs after the
+    // transcript container is cleared, so the uncaught throw blanked the
+    // whole session. Emit order is identical — list open, items, nested
+    // sublists, item close, list close — but sublists are pushed onto an
+    // explicit work stack instead of the call stack.
+    const html=[];
+    const work=[];                                  // {open:list} | {item} | {close:list} | {closeItem:true}
+    for(let i=root.items.length-1;i>=0;i--) work.push({open:root.items[i]});
+    while(work.length){
+      const f=work.pop();
+      if(f.item){
+        const it=f.item;
+        const text=it.content.join('\n').trim();
+        let inner;
+        if(!it.ordered && /^\[x\] /i.test(text)) inner='<span class="task-done">✅</span> '+inlineMd(text.slice(4));
+        else if(!it.ordered && /^\[ \] /.test(text)) inner='<span class="task-todo">☐</span> '+inlineMd(text.slice(4));
+        else inner=inlineMd(text);
+        const valueAttr=it.value!==null?` value="${it.value}"`:'';
+        html.push(`<li${valueAttr}>`,inner);
+        work.push({closeItem:true});                // </li> after any nested sublists
+        for(let i=it.sublists.length-1;i>=0;i--) work.push({open:it.sublists[i]});
+      } else if(f.closeItem){
+        html.push('</li>');
+      } else if(f.open){
+        const ln=f.open;
+        html.push('<',ln.ordered?'ol':'ul','>');
+        work.push({close:ln});                      // </ul>/</ol> after all items
+        for(let i=ln.items.length-1;i>=0;i--) work.push({item:ln.items[i]});
+      } else {
+        html.push('</',f.close.ordered?'ol':'ul','>');
+      }
+    }
+    return html.join('');
   }
-  function _renderLists(src, ordered){
+  function _renderLists(src){
+    // Single pass over source lines: collect a contiguous list region (any
+    // marker family, top-level or nested, plus continuation lines) and hand
+    // it to _renderListBlock, which builds the structural <ul>/<ol> tree.
     const lines=src.split('\n');
     const out=[];
-    const topRe=ordered?/^(?:  )?\d+\. /:/^(?:  )?[-*+] /;
-    const nestedRe=ordered?/^ {2,}\d+\. /:/^ {2,}[-*+] /;
+    const topRe=/^(?:  )?(?:\d+\.|[-*+]) /;
+    const nestedRe=/^ {2,}(?:\d+\.|[-*+]) /;
     const contRe=/^ {2,}\S/;
     let i=0;
     while(i<lines.length){
@@ -7471,18 +8045,16 @@ function renderMd(raw){
         }
         break;
       }
-      out.push(_renderListBlock(block,ordered));
+      out.push(_renderListBlock(block));
     }
     return out.join('\n');
   }
-  // Preserve continuation lines, nested indentation, and LaTeX placeholder lines
-  // inside list items without changing the wider markdown pipeline.
-  s=_renderLists(s,false);
-  // Ordered-list parsing intentionally runs on the post-unordered string; the
-  // unordered pass emits <ul> HTML that cannot satisfy the ordered-item regex.
-  // Keep continuation lines attached to their item and preserve explicit
-  // numbering via value= even when blank lines split the markdown.
-  s=_renderLists(s,true);
+  // Single-pass list stage (#6700): one parser handles both marker families
+  // with a stack keyed by indentation + marker kind, so mixed nested lists
+  // (ul→ol→ul) build valid <ul>/<ol> structure instead of re-parsing
+  // renderer-generated HTML as Markdown. value="N" is still emitted on every
+  // ordered <li> so explicit numbering survives blank-line splits (#886).
+  s=_renderLists(s);
   // Tables: | col | col | header row followed by | --- | --- | separator then data rows
   // NOTE: table pass runs BEFORE outer link pass so [label](url) in table cells
   // is handled by inlineMd() only — prevents double-linking.
@@ -7645,8 +8217,7 @@ function renderMd(raw){
     const a=_attrs(rawAttrs);
     if(name==='li'){
       const value=/^\d+$/.test(a.value||'')?` value="${esc(a.value)}"`:'';
-      const style=(a.style||'').replace(/\s+/g,'').toLowerCase()==='margin-left:16px'?` style="margin-left:16px"`:'';
-      return `<li${value}${style}>`;
+      return `<li${value}>`;
     }
     if(name==='span'){
       return `<span${_cls(a.class,['task-done','task-todo','katex-inline'])}${a['data-katex']==='inline'?' data-katex="inline"':''}>`;
@@ -7683,9 +8254,11 @@ function renderMd(raw){
   // Stash <a>, <img> and <pre> blocks so autolink never runs inside them.
   const _al_stash=[];
   s=s.replace(/(<a\b[^>]*>[\s\S]*?<\/a>|<img\b[^>]*>|<pre\b[^>]*>[\s\S]*?<\/pre>)/g,m=>{_al_stash.push(m);return `\x00B${_al_stash.length-1}\x00`;});
-  s=s.replace(/(https?:\/\/[^\s<>"'\)\]]+)/g,(url)=>{
-    // Strip trailing punctuation that was likely not part of the URL
-    const trail=url.match(/[.,;:!?)]$/)?url.slice(-1):'';
+  s=s.replace(/(https?:\/\/[^\s<>"')\]\uFF09]+)/g,(url)=>{
+    // Strip trailing punctuation that was likely not part of the URL.
+    // CJK full-width punctuation (）。，；：！？、) is included because LLMs
+    // frequently use full-width delimiters in Chinese/Japanese text.
+    const trail=url.match(/[.,;:!?)]$/)||url.match(/[\uFF09\uFF0C\uFF1B\uFF1A\uFF01\uFF1F\u3001\u3002]$/)?url.slice(-1):'';
     const clean=trail?url.slice(0,-1):url;
     return `<a href="${clean}" target="_blank" rel="noopener">${esc(clean)}</a>${trail}`;
   });
@@ -7744,7 +8317,13 @@ function setStatus(t){
   showToast(t, 4000);
 }
 
-function setComposerStatus(t){
+let _composerStatusTimer=null;
+
+function setComposerStatus(t,timeoutMs){
+  if(_composerStatusTimer!==null){
+    clearTimeout(_composerStatusTimer);
+    _composerStatusTimer=null;
+  }
   const el=$('composerStatus');
   if(!el)return;
   const statusHidden=!!(window._composerControlVisibility&&window._composerControlVisibility.hide_composer_status);
@@ -7763,6 +8342,14 @@ function setComposerStatus(t){
   el.removeAttribute('aria-hidden');
   el.textContent=t;
   el.style.display='';
+  if(timeoutMs>0){
+    const timer=setTimeout(()=>{
+      if(_composerStatusTimer!==timer)return;
+      _composerStatusTimer=null;
+      setComposerStatus('');
+    },timeoutMs);
+    _composerStatusTimer=timer;
+  }
 }
 
 let _composerLockState=null;
@@ -8657,7 +9244,7 @@ function _playEdgeTtsChunked(text, btn){
     fetch(new URL('api/tts', document.baseURI || location.href).href, {
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({text:chunk, voice:voice, rate:rate, pitch:pitch})
+      body:JSON.stringify({text:chunk, voice:voice, rate:rate, pitch:pitch, engine:'edge'})
     })
     .then(function(r){
       if(!r.ok){
@@ -9306,7 +9893,33 @@ function snapshotLiveTurnHtmlForSession(sid){
   const turn=$('liveAssistantTurn');
   if(!turn) return;
   if(turn.dataset&&turn.dataset.sessionId&&turn.dataset.sessionId!==sid) return;
-  INFLIGHT[sid].liveTurnHtml=turn.outerHTML;
+  let snapshotTurn=turn;
+  const sourceControls=turn.querySelectorAll
+    ? Array.from(turn.querySelectorAll('.transparent-event-copy,.thinking-copy-btn'))
+    : [];
+  if(sourceControls.some(control=>!!control._transparentCopiedFeedbackNormal)){
+    // Copy-success feedback is transient, while its normal presentation lives
+    // only on element properties. Sanitize an independent clone so switching
+    // sessions cannot persist the check/Copied/accent presentation, without
+    // mutating the visible control or disturbing its active feedback timer.
+    snapshotTurn=turn.cloneNode(true);
+    const clonedControls=Array.from(snapshotTurn.querySelectorAll('.transparent-event-copy,.thinking-copy-btn'));
+    sourceControls.forEach((source,index)=>{
+      const normal=source._transparentCopiedFeedbackNormal;
+      const clone=clonedControls[index];
+      if(!normal||!clone) return;
+      clone.innerHTML=normal.innerHTML;
+      if(clone.style){
+        if(normal.styleCssText!==null) clone.style.cssText=normal.styleCssText;
+        else clone.style.color=normal.color||'';
+      }
+      if(normal.titleAttr===null) clone.removeAttribute('title');
+      else clone.setAttribute('title',normal.titleAttr);
+      if(normal.ariaLabel===null) clone.removeAttribute('aria-label');
+      else clone.setAttribute('aria-label',normal.ariaLabel);
+    });
+  }
+  INFLIGHT[sid].liveTurnHtml=snapshotTurn.outerHTML;
 }
 
 function _liveAssistantSegmentTextLength(seg){
@@ -9600,6 +10213,7 @@ async function refreshSession() {
   try {
     const data = await api(`/api/session?session_id=${encodeURIComponent(S.session.session_id)}`);
     S.session = data.session;
+    if(typeof _adoptRegenerationRevision==='function') _adoptRegenerationRevision(data.session);
     S.messages = data.session.messages || [];
     _messagesTruncated = !!data.session._messages_truncated;
     _oldestIdx = data.session._messages_offset || 0;
@@ -10443,14 +11057,14 @@ function _activeTurnTokenMatches(msg, session){
  * same text twice in a row (a plain "继续" follow-up) legitimately gets two
  * identical user turns, and matching on text would swallow the new one. The
  * discriminator is therefore exact identity, never proximity: the active turn's
- * row either carries the server-stamped `_active_turn_token` (stream_id +
- * started_at — unique to this turn), or its timestamp equals `pending_started_at`
- * within a precision-only epsilon that absorbs float/state.db drift but never a
- * full second. A whole-second (or sub-second) mismatch is ambiguous and returns
- * null so the caller materializes the pending turn — the transient duplicate is
- * harmless, hiding a turn + moving its attachments is not. Text equality is
- * still required downstream, so a false match needs identical text AND an exact
- * identity signal.
+ * public row carries `_active_turn_user`, while private rows carry the server-
+ * stamped `_active_turn_token` (stream_id + started_at — unique to this turn),
+ * or their timestamp equals `pending_started_at` within a precision-only epsilon
+ * that absorbs float/state.db drift but never a full second. A whole-second (or
+ * sub-second) mismatch is ambiguous and returns null so the caller materializes
+ * the pending turn — the transient duplicate is harmless, hiding a turn + moving
+ * its attachments is not. Text equality is still required downstream, so a false
+ * match needs identical text AND an exact identity signal.
  */
 function _pendingActiveTurnUserMessage(messages, session){
   const startedAt=Number(session?.pending_started_at);
@@ -10460,6 +11074,8 @@ function _pendingActiveTurnUserMessage(messages, session){
     const msg=list[i];
     if(!msg||String(msg.role||'')!=='user') continue;
     if(typeof _isContextCompactionMessage==='function'&&_isContextCompactionMessage(msg)) continue;
+    // Public projections replace the private token with this authoritative marker.
+    if(msg._active_turn_user===true) return msg;
     // Unambiguous: the row carries the active turn's exact token
     // (stream_id + started_at) stamped by the server's eager-checkpoint path.
     if(typeof _activeTurnTokenMatches==='function'&&_activeTurnTokenMatches(msg,session)) return msg;
@@ -11216,7 +11832,124 @@ function _transparentToolSummary(tc){
   if(target) return target;
   return '';
 }
-function _copyEventToClipboard(row){
+function _showTransparentCopiedFeedback(control,row,opts){
+  if(!control&&!row) return;
+  opts=opts||{};
+  // A live-row refresh may replace a header's copy control with new markup.
+  // Keep the lifetime on the persistent row, then resolve the currently visible
+  // control for every render/expiry rather than retaining a detached button.
+  const feedbackRow=row||(control&&control.closest?control.closest('.transparent-event-row'):null);
+  const owner=feedbackRow||control;
+  if(!owner) return;
+  const currentControl=()=>{
+    if(feedbackRow&&feedbackRow.querySelector){
+      return feedbackRow.querySelector('.transparent-event-copy,.thinking-copy-btn');
+    }
+    return control||null;
+  };
+  const connectedControl=()=>{
+    const target=currentControl();
+    if(!target||target.isConnected!==true) return null;
+    if(feedbackRow&&feedbackRow.isConnected!==true) return null;
+    return target;
+  };
+  const clearFeedbackState=(state)=>{
+    if(state&&state.timer){
+      clearTimeout(state.timer);
+      state.timer=null;
+    }
+    if(owner._transparentCopiedFeedback===state) delete owner._transparentCopiedFeedback;
+  };
+  const restoreControl=(target)=>{
+    if(!target) return;
+    const normal=target._transparentCopiedFeedbackNormal;
+    if(!normal) return;
+    target.innerHTML=normal.innerHTML;
+    if(target.style){
+      if(normal.styleCssText!==null) target.style.cssText=normal.styleCssText;
+      else target.style.color=normal.color||'';
+    }
+    if(normal.titleAttr===null){
+      if(target.removeAttribute) target.removeAttribute('title');
+    }else if(target.setAttribute){
+      target.setAttribute('title',normal.titleAttr);
+    }
+    if(normal.ariaLabel===null){
+      if(target.removeAttribute) target.removeAttribute('aria-label');
+    }else if(target.setAttribute){
+      target.setAttribute('aria-label',normal.ariaLabel);
+    }
+    delete target._transparentCopiedFeedbackNormal;
+  };
+  const renderCopiedControl=(target)=>{
+    if(!target) return;
+    if(!target._transparentCopiedFeedbackNormal){
+      target._transparentCopiedFeedbackNormal={
+        innerHTML:target.innerHTML,
+        color:target.style?target.style.color:undefined,
+        styleCssText:target.style&&typeof target.style.cssText==='string'?target.style.cssText:null,
+        titleAttr:target.getAttribute?target.getAttribute('title'):null,
+        ariaLabel:target.getAttribute?target.getAttribute('aria-label'):null,
+      };
+    }
+    const copiedLabel=t('copied')||'Copied';
+    target.innerHTML=typeof li==='function'?li('check',11):'✓';
+    if(target.style){
+      target.style.color='var(--accent)';
+      target.style.opacity='1';
+    }
+    if(target.setAttribute) target.setAttribute('title',copiedLabel);
+    else target.title=copiedLabel;
+    if(target.setAttribute) target.setAttribute('aria-label',copiedLabel);
+  };
+  const now=Date.now();
+  let state=owner._transparentCopiedFeedback;
+  if(opts.rehydrate){
+    if(!state) return;
+    const target=connectedControl();
+    if(!target){
+      clearFeedbackState(state);
+      return;
+    }
+    if(!state.expiresAt||state.expiresAt<=now){
+      if(state.timer) clearTimeout(state.timer);
+      state.timer=null;
+      restoreControl(target);
+      if(owner._transparentCopiedFeedback===state) delete owner._transparentCopiedFeedback;
+      return;
+    }
+    renderCopiedControl(target);
+    return;
+  }
+  const target=connectedControl();
+  if(!target){
+    if(state) clearFeedbackState(state);
+    return;
+  }
+  if(!state){
+    state={timer:null,generation:0,expiresAt:0};
+    owner._transparentCopiedFeedback=state;
+  }else if(state.timer){
+    clearTimeout(state.timer);
+  }
+  state.generation+=1;
+  const generation=state.generation;
+  state.expiresAt=now+1500;
+  renderCopiedControl(target);
+  state.timer=setTimeout(()=>{
+    if(owner._transparentCopiedFeedback!==state||state.generation!==generation) return;
+    const expiryTarget=connectedControl();
+    if(!expiryTarget){
+      state.timer=null;
+      delete owner._transparentCopiedFeedback;
+      return;
+    }
+    state.timer=null;
+    restoreControl(expiryTarget);
+    delete owner._transparentCopiedFeedback;
+  },1500);
+}
+function _copyEventToClipboard(row,control){
   if(!row) return;
   const type=row.getAttribute('data-event-type');
   let text='';
@@ -11259,9 +11992,12 @@ function _copyEventToClipboard(row){
   }else{
     text=row.textContent||'';
   }
+  if(!text) return;
+  const copied=()=>_showTransparentCopiedFeedback(control,row);
   const fallback=()=>{
+    let ta=null;
     try{
-      const ta=document.createElement('textarea');
+      ta=document.createElement('textarea');
       ta.value=text;
       ta.setAttribute('readonly','');
       ta.style.position='absolute';
@@ -11269,14 +12005,17 @@ function _copyEventToClipboard(row){
       document.body.appendChild(ta);
       ta.select();
       const ok=document.execCommand('copy');
-      document.body.removeChild(ta);
+      if(ok) copied();
       if(typeof showToast==='function') showToast(ok?(t('copied')||'Copied'):(t('copy_failed')||'Copy failed'),1600);
     }catch(_){
       if(typeof showToast==='function') showToast(t('copy_failed')||'Copy failed',2000,'error');
+    }finally{
+      if(ta&&ta.parentNode) ta.parentNode.removeChild(ta);
     }
   };
   if(navigator&&navigator.clipboard&&navigator.clipboard.writeText){
     navigator.clipboard.writeText(text).then(()=>{
+      copied();
       if(typeof showToast==='function') showToast(`${t('copied')||'Copied'} ${label}`,1600);
     }).catch(fallback);
   }else{
@@ -11287,21 +12026,29 @@ function _attachCopyButton(header){
   if(!header) return null;
   const bindCopyButton=(btn)=>{
     if(!btn) return null;
+    const row=header.closest?header.closest('.transparent-event-row'):null;
+    const feedbackState=row&&row._transparentCopiedFeedback;
+    const feedbackActive=!!(feedbackState&&Number(feedbackState.expiresAt)>Date.now());
     btn.classList.add('transparent-event-copy');
     btn.setAttribute('role','button');
     btn.setAttribute('tabindex','0');
-    btn.setAttribute('aria-label',t('copy')||'Copy');
     btn.setAttribute('data-transparent-copy','1');
-    btn.title=t('copy')||'Copy';
+    if(!btn._transparentCopiedFeedback&&!feedbackActive){
+      btn.setAttribute('aria-label',t('copy')||'Copy');
+      btn.title=t('copy')||'Copy';
+    }
     const handler=function(ev){
       ev.stopPropagation();
       ev.preventDefault();
-      _copyEventToClipboard(header.closest('.transparent-event-row'));
+      _copyEventToClipboard(header.closest('.transparent-event-row'),btn);
     };
     btn.onclick=handler;
     btn.onkeydown=function(ev){
       if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();handler(ev);}
     };
+    if(btn.parentNode&&typeof _showTransparentCopiedFeedback==='function'){
+      _showTransparentCopiedFeedback(btn,row,{rehydrate:true});
+    }
     return btn;
   };
   // Reuse ANY existing copy button (handles both .transparent-event-copy
@@ -11324,6 +12071,8 @@ function _attachCopyButton(header){
   const toggle=header.querySelector('.tool-card-toggle,.thinking-card-toggle');
   if(toggle&&toggle.parentNode===header) header.insertBefore(btn,toggle);
   else header.appendChild(btn);
+  const row=header.closest?header.closest('.transparent-event-row'):null;
+  if(typeof _showTransparentCopiedFeedback==='function') _showTransparentCopiedFeedback(btn,row,{rehydrate:true});
   return btn;
 }
 function _transparentEventCountLabel(toolCount){
@@ -13233,14 +13982,38 @@ function _refreshTransparentThinkingLiveRow(existing, node){
   return true;
 }
 
+const _TRANSPARENT_FADE_BLOCK_TAGS = new Set([
+  'P','DIV','H1','H2','H3','H4','H5','H6','BLOCKQUOTE','LI','UL','OL','PRE','TABLE',
+]);
+
 function _bindTransparentFadeCleanup(body){
   if(!body || body._transparentFadeCleanupBound || typeof body.addEventListener !== 'function') return;
   body._transparentFadeCleanupBound = true;
   body.addEventListener('animationend', e=>{
     const span = e.target;
     if(!span || !span.classList || !span.classList.contains('stream-fade-word')) return;
-    span.replaceWith(document.createTextNode(span.textContent || ''));
+    // Keep the animated inline node stable for the lifetime of the live turn,
+    // exactly like _streamFadeBindCleanup() in messages.js. Replacing each word
+    // with a fresh text node makes native scroll anchoring choose a new anchor
+    // while the transparent prose row is still growing, producing a visible
+    // vertical bounce. Final settlement rebuilds plain persisted DOM.
+    span.classList.remove('is-new');
+    if(span.style) span.style.removeProperty('--stream-fade-ms');
   });
+}
+
+// Trailing block element of a live prose body, if any. Live rows are produced
+// by the incremental streaming-markdown path, which keeps an open block (a <p>)
+// as it parses; text appended as a sibling of that block would render on its
+// own line. Inline wrappers (fade spans) are not block boxes and are skipped.
+function _transparentFadeAppendTarget(body){
+  if(!body) return body;
+  const kids = body.childNodes;
+  if(!kids || !kids.length) return body;
+  const last = kids[kids.length - 1];
+  if(!last || last.nodeType !== 1) return body;
+  const tag = String(last.tagName || '').toUpperCase();
+  return _TRANSPARENT_FADE_BLOCK_TAGS.has(tag) ? last : body;
 }
 
 function _appendTransparentFadeText(body, text){
@@ -13268,13 +14041,58 @@ function _appendTransparentFadeText(body, text){
   }
   if(!changed) frag.appendChild(document.createTextNode(value));
   else if(last < value.length) frag.appendChild(document.createTextNode(value.slice(last)));
-  body.appendChild(frag);
+  // Append inside the trailing block element (the streaming markdown parser's
+  // open <p>) rather than at the root of .msg-body. A block sibling would start
+  // its own line box, so a continuation of the current sentence — in particular
+  // the tail of a word — must land inside that block to stay on the same line.
+  _transparentFadeAppendTarget(body).appendChild(frag);
 }
 
 function _refreshTransparentFadeProseRow(existing, node, preservedState){
+  if(!existing || !node) return node || existing;
+  if(existing === node) return existing;
   let body = existing.querySelector ? existing.querySelector('.msg-body') : null;
   const nextText = String((node.dataset && node.dataset.rawText) || (node.textContent || ''));
-  const currentText = String(existing.getAttribute('data-stream-fade-text') || (body && body.textContent) || '');
+  // Resume strictly from the source-space cursor. `body.textContent` is NOT a
+  // valid substitute: rows built by the incremental streaming-markdown path
+  // render one character behind their source text (the parser holds the last
+  // character pending), so falling back to rendered text yields a delta that
+  // starts mid-word and tears the word in half. With no cursor we cannot know
+  // how much of the source is already rendered, so rebuild the body instead of
+  // guessing a delta.
+  const hasCursor = !!(existing.getAttribute && existing.getAttribute('data-stream-fade-text') !== null);
+  const currentText = hasCursor ? String(existing.getAttribute('data-stream-fade-text') || '') : '';
+  const candidateBody = node.querySelector ? node.querySelector('.msg-body') : null;
+  const parserOwned = !!(candidateBody && candidateBody !== body && candidateBody.__smdParser);
+  const mute = (typeof window !== 'undefined' && typeof window.__streamFadeMuteRenderedPrefix === 'function')
+    ? window.__streamFadeMuteRenderedPrefix
+    : null;
+  if(parserOwned){
+    // Promote the actual parser-owned candidate into the keyed row's DOM
+    // position once. Cloning its children into the old visible row on every
+    // later growth frame cuts off the previous tail word's ~620ms fade
+    // (`.is-new` is stripped from the replacement) and breaks word-node
+    // identity used for scroll-anchor stability. After this swap, later
+    // keyed renders hit `_refreshTransparentLiveRow(existing === node)` and
+    // keep growing the same parser target. Pending and MEDIA tails stay on
+    // the parser until it flushes them.
+    const prevRendered = String((body && body.textContent) || '');
+    if(candidateBody.classList) candidateBody.classList.add('stream-fade-active');
+    _bindTransparentFadeCleanup(candidateBody);
+    if(mute && prevRendered) mute(candidateBody, prevRendered);
+    if(node.removeAttribute) node.removeAttribute('data-stream-fade-text');
+    const parent = existing.parentNode || existing.parentElement || null;
+    if(parent && existing.parentNode === parent){
+      if(typeof parent.replaceChild === 'function'){
+        parent.replaceChild(node, existing);
+      }else if(typeof parent.insertBefore === 'function'){
+        parent.insertBefore(node, existing);
+        if(typeof existing.remove === 'function') existing.remove();
+      }
+    }
+    _rehydrateTransparentLiveRow(node, existing, preservedState);
+    return node;
+  }
   const pairs = _transparentLiveRowAttributePairs(node);
   const kept = Object.create(null);
   for(const pair of pairs){
@@ -13295,14 +14113,42 @@ function _refreshTransparentFadeProseRow(existing, node, preservedState){
     existing.appendChild(body);
   }
   if(body.classList) body.classList.add('stream-fade-active');
-  if(!nextText.startsWith(currentText)){
-    body.textContent = '';
+  if(!hasCursor || !nextText.startsWith(currentText)){
+    // Rebuild branch. Snapshot the rendered text BEFORE clearing (#7082
+    // review should-fix): without it every word re-wraps as `.is-new`, the
+    // whole visible row dips to opacity 0 and fades back (~620ms), and the
+    // wholesale node replacement invites the one-time scroll-anchor bounce
+    // the #6257 comment in `_bindTransparentFadeCleanup` warns about.
+    const prevRendered = String(body.textContent || '');
     existing.setAttribute('data-stream-fade-text', '');
-    _appendTransparentFadeText(body, nextText);
+    // Non-parser candidates may still carry a parsed-looking body (tests and
+    // rewind rebuilds). Clone that DOM when present so we do not flatten it
+    // back to literal source.
+    let resumeCursor = nextText;
+    if(candidateBody && candidateBody !== body &&
+       typeof candidateBody.cloneNode === 'function' &&
+       candidateBody.childNodes && candidateBody.childNodes.length){
+      const clone = candidateBody.cloneNode(true);
+      body.textContent = '';
+      while(clone.childNodes && clone.childNodes.length) body.appendChild(clone.childNodes[0]);
+      _bindTransparentFadeCleanup(body);
+      const renderedNow = String(body.textContent || '');
+      if(renderedNow && nextText.startsWith(renderedNow)) resumeCursor = renderedNow;
+    }else{
+      body.textContent = '';
+      _appendTransparentFadeText(body, nextText);
+    }
+    // messages.js `_streamFadeMuteRenderedPrefix` idiom (exported on window the
+    // same way `__anchorProseIncrementalNode` is): rendered-space compare of the
+    // pre-rebuild snapshot against the rebuilt body, stripping `.is-new` from
+    // spans inside the common prefix so already-visible words do not replay
+    // their fade — only genuinely-new tail words animate.
+    if(mute && prevRendered) mute(body, prevRendered);
+    existing.setAttribute('data-stream-fade-text', resumeCursor);
   }else{
     _appendTransparentFadeText(body, nextText.slice(currentText.length));
+    existing.setAttribute('data-stream-fade-text', nextText);
   }
-  existing.setAttribute('data-stream-fade-text', nextText);
   _rehydrateTransparentLiveRow(existing, node, preservedState);
   return existing;
 }
@@ -14442,6 +15288,22 @@ function _isContextCompactionMessage(m){
 function _isContextCompactionText(text){
   return /^\s*\[context compaction/i.test(String(text||'')) || /^\s*context compaction/i.test(String(text||''));
 }
+function _compactionSummarySegment(text){
+  // Mirror of api/compression_anchor.py compaction_summary_segment(). The
+  // replay patch carries this helper so it stays self-contained on upstream.
+  const s=String(text||'').replace(/^\s+/,'');
+  const low=s.toLowerCase();
+  if(low.startsWith('[context compaction')||low.startsWith('context compaction')) return s;
+  if(!low.startsWith('[prior context')) return null;
+  const delim=low.indexOf('[end of prior context');
+  if(delim===-1) return null;
+  const after=s.slice(delim);
+  const close=after.indexOf(']');
+  if(close===-1) return null;
+  const segment=after.slice(close+1).replace(/^\s+/,'');
+  if(segment.toLowerCase().startsWith('[context compaction')) return segment;
+  return null;
+}
 function _isPreservedCompressionTaskListMarkerText(text){
   return /^\s*\[your active task list was preserved across context compression\]/i.test(String(text||''));
 }
@@ -14521,9 +15383,91 @@ function _latestCompressionReferenceMessage(messages, summaryText=''){
 function _shouldShowSettledCompressionReference(referenceText){
   return !!String(referenceText||'').trim() && !_isContextCompactionText(referenceText);
 }
+// Ultra-compact display (2026-08-18): the compaction marker text starts with a
+// long fixed envelope of handling instructions. The conversation card must
+// preview the DIGEST (goal/state the user cares about), never the envelope.
+function _compactionDigestText(text){
+  const s=String(text||'');
+  // The envelope prose ends right before the first markdown heading on its
+  // own line. Quoted headings inside the envelope (e.g. "from '## Historical
+  // Task Snapshot' or any other section") never sit at line start.
+  const m=s.match(/(^|\n)#{1,3} [^\n]/);
+  if(!m) return s.trim();
+  const start=m.index+(m[1]?1:0);
+  return s.slice(start).trim();
+}
+function _compactionCardPreview(text){
+  const digest=_compactionDigestText(text)
+    .replace(/^#{1,3} /gm,'')
+    .replace(/^Historical Task Snapshot\s*/i,'');
+  return digest.split(/\n+/).map(l=>l.trim()).filter(Boolean).slice(0,2).join(' ').slice(0,220);
+}
+// All compaction markers present in the LOADED transcript, oldest first. Each
+// one renders as its own collapsed card at its real position so the user can
+// see when the context was compacted and reopen the digest inline.
+function _loadedCompactionMarkerRawIdxs(messages){
+  const out=[];
+  if(!Array.isArray(messages)) return out;
+  for(let i=0;i<messages.length;i++){
+    if(_isContextCompactionMessage(messages[i])) out.push(i);
+  }
+  return out;
+}
+// A settled compaction whose marker sits before the server-loaded tail must
+// remain visible at the top of that tail. Anchoring it to an old assistant/tool
+// turn can bury it inside a hidden worklog, which makes compaction look absent.
+// `currentSummaryFallback` is true when the session's current summary matches
+// no loaded marker and therefore renders as its own settled card. That card is
+// the newest compaction the user can see, so it owns the preserved task cards
+// and no marker card may attach them again.
+function _selectCompactionCardPlacements(markerRawIdxs,firstRenderedRawIdx,currentSummaryFallback=false){
+  const preWindowMarkers=[];
+  const inlineMarkers=[];
+  const boundary=Number.isFinite(firstRenderedRawIdx)?firstRenderedRawIdx:-1;
+  for(const value of Array.isArray(markerRawIdxs)?markerRawIdxs:[]){
+    const rawIdx=Number(value);
+    if(!Number.isInteger(rawIdx)||rawIdx<0) continue;
+    if(rawIdx<boundary) preWindowMarkers.push(rawIdx);
+    else inlineMarkers.push(rawIdx);
+  }
+  const taskOwner=currentSummaryFallback
+    ?{kind:'current-summary',rawIdx:-1}
+    :inlineMarkers.length
+      ?{kind:'inline',rawIdx:inlineMarkers[inlineMarkers.length-1]}
+      :!preWindowMarkers.length
+        ?null
+        :{kind:'pre-window',rawIdx:preWindowMarkers[preWindowMarkers.length-1]};
+  return {preWindowMarkers,inlineMarkers,taskOwner};
+}
+function _insertCompactionCardNodes(entries,taskOwner,insertNode){
+  const insertedNodes=[];
+  let taskOwnerNode=null;
+  if(!Array.isArray(entries)||typeof insertNode!=='function') return {insertedNodes,taskOwnerNode};
+  for(const entry of entries){
+    if(!entry?.node) continue;
+    const inserted=insertNode(entry.node,entry.rawIdx,entry.kind)!==false;
+    if(!inserted||!entry.node.parentElement) continue;
+    insertedNodes.push(entry.node);
+    if(taskOwner&&entry.kind===taskOwner.kind&&entry.rawIdx===taskOwner.rawIdx) taskOwnerNode=entry.node;
+  }
+  return {insertedNodes,taskOwnerNode};
+}
+function _insertPreservedCompressionTaskFallback(taskOwnerNode,standaloneNode,insertNode){
+  if(taskOwnerNode?.parentElement||!standaloneNode||typeof insertNode!=='function') return false;
+  return insertNode(standaloneNode)!==false&&!!standaloneNode.parentElement;
+}
+function _pinCompactionCardAtTop(inner,node){
+  if(!inner||!node) return false;
+  inner.appendChild(node);
+  return true;
+}
+function _pinSettledCompressionReferenceAtTop(inner,node,referenceMessageRawIdx){
+  if(referenceMessageRawIdx>=0) return false;
+  return _pinCompactionCardAtTop(inner,node);
+}
 function _compressionReferenceCardHtml(text, open=false){
   const copy=_engineAwareCompressionCopy();
-  const preview=text.split(/\n+/).filter(Boolean).slice(0,2).join(' ');
+  const preview=_compactionCardPreview(text)||text.split(/\n+/).filter(Boolean).slice(0,2).join(' ');
   return `
     <div class="tool-card-row compression-card-row" data-compression-card="1" data-raw-text="${esc(text)}">
       <div class="tool-card tool-card-compress-reference${open?' open':''}">
@@ -14755,6 +15699,54 @@ function clearMessageRenderCache(){
   _clearMessageVirtualHeightCache();
 }
 
+// #6999: feed a structured payload field's string form through the FNV-1a
+// loop IN FULL, without materializing clipped copies or skipping the middle.
+// The previous length+head+tail clip made same-length middle-only edits
+// (tool arguments, attachment metadata, tool snippets, compression-anchor
+// keys) produce identical signatures — a deterministic stale-cache collision
+// in _sessionHtmlCache (cross-session navigation served old HTML). Hashing
+// every character keeps the signature sensitive to ANY content change at a
+// constant-allocation cost: strings are streamed char-by-char (no copy) and
+// object fields are walked key-by-key so only scalar string forms are ever
+// allocated — no integral JSON.stringify() of a whole payload, and no
+// head/tail slice copies. _renderCacheKey's length+edges shortcut is only
+// safe for the render-window geometry key, where equal span+edges means
+// equal window; here equal signature must mean equal CONTENT.
+function _addBoundedHash(add, value, depth){
+  if(value==null){ add('null'); return; }
+  const t=typeof value;
+  if(t==='string'){ add(value.length); add(value); return; }
+  if(t==='number'||t==='boolean'){ add(t); add(value); return; }
+  if(t==='object'){ _hashObjectInto(add, value, (depth||0)+1); return; }
+  add(t); add(String(value));
+}
+function _hashObjectInto(add, value, depth){
+  if(value==null){ add('null'); return; }
+  if(depth>64){
+    // Pathological depth (e.g. a cyclic structure JSON.stringify would also
+    // reject): serialize integrally so no field is silently dropped — the
+    // exact same data still yields the exact same signature.
+    try{ add(JSON.stringify(value)); }catch(e){ add('[unserializable]'); }
+    return;
+  }
+  if(Array.isArray(value)){
+    add('array'); add(value.length);
+    for(let i=0;i<value.length;i++){ add(i); _addBoundedHash(add, value[i], depth); }
+    return;
+  }
+  add('object');
+  // #6999 re-gate: walk keys in INSERTION ORDER (never sorted) so the cache
+  // signature equals the rendered projection — the tool-detail render paths
+  // use Object.entries(tc.args), which preserves insertion order. Sorting here
+  // gave opposite-insertion-order argument objects the same signature while
+  // they render DIFFERENT HTML. The explicit per-key index is the
+  // insertion-order discriminator: {alpha:A, beta:B} and {beta:B, alpha:A}
+  // now hash differently.
+  const keys=Object.keys(value);
+  add(keys.length);
+  for(let i=0;i<keys.length;i++){ add(keys[i]); add(i); _addBoundedHash(add, value[keys[i]], depth); }
+}
+
 function _messageRenderCacheSignature(){
   let hash=2166136261;
   function add(value){
@@ -14781,24 +15773,31 @@ function _messageRenderCacheSignature(){
     }
     if(Array.isArray(m.tool_calls)){
       add('message-tool-calls');add(m.tool_calls.length);
-      m.tool_calls.forEach(tc=>{add(tc&&tc.id);add(tc&&tc.name);add(tc&&tc.type);add(JSON.stringify(tc&&tc.function||{}));});
+      m.tool_calls.forEach(tc=>{
+        add(tc&&tc.id);add(tc&&tc.name);add(tc&&tc.type);
+        add(tc&&tc.function&&tc.function.name);
+        // function.arguments is already a string — streamed in full, no copy.
+        _addBoundedHash(add, tc&&tc.function&&tc.function.arguments);
+      });
     }
     if(Array.isArray(m._partial_tool_calls)){
       add('partial-tool-calls');add(m._partial_tool_calls.length);
       m._partial_tool_calls.forEach(tc=>{add(tc&&tc.id);add(tc&&tc.name);add(tc&&tc.snippet);});
     }
     if(_messageHasReasoningPayload(m)) add(m.reasoning||m.thinking||m._reasoning||'reasoning');
-    if(Array.isArray(m.attachments)) m.attachments.forEach(a=>add(a&&typeof a==='object'?JSON.stringify(a):a));
+    if(Array.isArray(m.attachments)) m.attachments.forEach(a=>_addBoundedHash(add, a));
   }
   const toolCalls=Array.isArray(S.toolCalls)?S.toolCalls:[];
   add('settled-tool-calls');add(toolCalls.length);
   toolCalls.forEach(tc=>{
     if(!tc||typeof tc!=='object'){ add(tc); return; }
-    add(tc.tid);add(tc.id);add(tc.name);add(tc.done);add(tc.is_diff);add(tc.assistant_msg_idx);add(tc.snippet);add(JSON.stringify(tc.args||{}));
+    add(tc.tid);add(tc.id);add(tc.name);add(tc.done);add(tc.is_diff);add(tc.assistant_msg_idx);
+    _addBoundedHash(add, tc.snippet);
+    _addBoundedHash(add, tc.args||{});
   });
   if(S.session){
     add(S.session.message_count);add(S.session.updated_at);add(S.session.compression_anchor_visible_idx);
-    add(JSON.stringify(S.session.compression_anchor_message_key||null));
+    _addBoundedHash(add, S.session.compression_anchor_message_key||null);
     add(S.session.compression_anchor_summary||'');
   }
   return `${messages.length}:${toolCalls.length}:${hash.toString(16)}`;
@@ -16013,22 +17012,27 @@ function renderMessages(options){
   if(sid&&INFLIGHT[sid]){
     const _lt=document.getElementById('liveAssistantTurn');
     if(_lt&&(!_lt.dataset||!_lt.dataset.sessionId||_lt.dataset.sessionId===sid)){
-      // Blank-turn fix (对话消失): only preserve the live turn across the DOM
-      // wipe if it is GENUINELY live — either an active stream is still running
-      // (S.activeStreamId set: the #3877 mid-stream flicker case this preserve
-      // was written for), or the turn already holds real rendered content (a
-      // visible answer body, a tool card, or a reasoning row). A DEAD shell —
-      // an interrupted turn whose stream dropped (S.activeStreamId cleared to
-      // null) but whose INFLIGHT[sid] entry was not cleaned, leaving only an
-      // empty worklog group ("Processed Ns" with no body/tool rows) — must NOT
-      // be preserved: re-attaching it on a session-updated swap re-render pins
-      // an avatar-only empty turn OVER the settled transcript, hiding the real
-      // (already-persisted) answer. That is the reported blank. Reproduced +
-      // fix verified on an isolated debug instance (8710): stale INFLIGHT +
-      // empty live-turn survived the swap → blank; gating on real-content /
-      // active-stream clears it while a genuine live turn still renders.
-      const _hasRealLiveContent=!!_lt.querySelector('.msg-body, .tool-card-row, .wl-reason');
-      if(_hasRealLiveContent || S.activeStreamId){
+      // Live-turn preservation requires a PROVABLE live owner — never bare DOM
+      // content. (#6948) The live turn is preserved across the wipe only while
+      // (a) the stream is genuinely active (S.activeStreamId — the #3877
+      // mid-stream flicker case this preserve was written for), or (b) the
+      // current message projection (S.messages) still carries explicit
+      // live-assistant evidence — a client-side _live / _activityBurstId /
+      // _liveSegmentSeq marker merged in from the INFLIGHT tail or a server
+      // journal snapshot (the reconnect / terminal-projection case). A settled
+      // transcript has neither, so a contentful but DEAD live node (stream
+      // ended — S.activeStreamId cleared — while INFLIGHT[sid] was not yet
+      // cleaned) is no longer preserved: re-attaching it over the settled
+      // transcript pinned a second copy of the same assistant message (#6948;
+      // data was always clean — state.db, sidecar, and /api/session each hold
+      // one row; the duplicate existed only in the rendered DOM). The #5390
+      // blank-turn guard (对话消失) is preserved: a dead EMPTY shell has no live
+      // projection either, so it is still dropped with the wipe instead of
+      // pinning an avatar-only blank turn over the settled answer.
+      const _hasLiveAssistantProjection=Array.isArray(S.messages)&&S.messages.some(m=>
+        m&&m.role==='assistant'&&(m._live||m._activityBurstId!==undefined||m._liveSegmentSeq!==undefined)
+      );
+      if(S.activeStreamId || _hasLiveAssistantProjection){
         _preservedLiveTurn=_lt;
       }
     }
@@ -16104,13 +17108,60 @@ function renderMessages(options){
     S.messages,
     sessionCompressionSummary
   );
-  const referenceText=referenceMessage
-    ? msgContent(referenceMessage)||String(referenceMessage.content||'')
-    : sessionCompressionSummary;
-  const referenceNode=(!compressionState && _shouldShowSettledCompressionReference(referenceText) && (sessionCompressionAnchor!==null || sessionCompressionAnchorKey || sessionCompressionSummary))
-    ? (()=>{const row=document.createElement('div');row.innerHTML=`<div class="compression-turn"><div class="compression-turn-blocks">${_compressionReferenceCardHtml(referenceText,false)}${_preservedCompressionTaskListCardsHtml(preservedCompressionTaskMessages)}</div></div>`;return row.firstElementChild;})()
+  const referenceText=(()=>{
+    if(!referenceMessage) return sessionCompressionSummary;
+    const raw=msgContent(referenceMessage)||String(referenceMessage.content||'');
+    const segment=_compactionSummarySegment(raw);
+    return segment!==null?segment:raw;
+  })();
+  // Ultra-compact display (2026-08-18): every compaction marker loaded in the
+  // transcript renders as its own collapsed card at its real position, so the
+  // user SEES each compaction and can reopen its digest inline. Markers older
+  // than the virtual window are pinned above the rendered rows in transcript
+  // order; markers inside the window stay inline.
+  const firstRenderedRawIdx=renderVisWithIdx.length?renderVisWithIdx[0].rawIdx:Infinity;
+  const loadedCompactionRawIdxs=(!compressionState)?_loadedCompactionMarkerRawIdxs(S.messages):[];
+  // A loaded marker that matches the current summary already renders as its
+  // own card. When none matches (referenceMessageRawIdx<0) the current summary
+  // is still authoritative and must stay visible even next to stale markers,
+  // so the settled fallback is decided here, before any card node is built,
+  // and takes part in the single preserved-task owner selection.
+  const showCurrentSummaryFallback=!!(!compressionState && referenceMessageRawIdx<0 && _shouldShowSettledCompressionReference(referenceText) && (sessionCompressionAnchor!==null || sessionCompressionAnchorKey || sessionCompressionSummary));
+  const compactionPlacements=_selectCompactionCardPlacements(loadedCompactionRawIdxs,firstRenderedRawIdx,showCurrentSummaryFallback);
+  const referenceNodeOwnsTasks=!!(showCurrentSummaryFallback
+    && compactionPlacements.taskOwner
+    && compactionPlacements.taskOwner.kind==='current-summary'
+    && preservedCompressionTaskMessages.length);
+  const _compactionCardEntry=(markerRawIdx,kind)=>{
+    const markerMsg=S.messages[markerRawIdx];
+    let raw='';
+    try{
+      raw=String(msgContent(markerMsg)||'');
+    }catch(_){
+      raw=String((markerMsg&&markerMsg.content)||'');
+    }
+    const segment=_compactionSummarySegment(raw);
+    const text=segment!==null?segment:raw;
+    const ownsTasks=!!(compactionPlacements.taskOwner
+      && compactionPlacements.taskOwner.kind===kind
+      && compactionPlacements.taskOwner.rawIdx===markerRawIdx);
+    const row=document.createElement('div');
+    row.innerHTML=`<div class="compression-turn"><div class="compression-turn-blocks">${_compressionReferenceCardHtml(text,false)}${ownsTasks?_preservedCompressionTaskListCardsHtml(preservedCompressionTaskMessages):''}</div></div>`;
+    const node=row.firstElementChild;
+    if(node){
+      node.setAttribute('data-compaction-placement',kind);
+      node.setAttribute('data-compaction-raw-idx',String(markerRawIdx));
+      if(ownsTasks&&preservedCompressionTaskMessages.length) node.setAttribute('data-compaction-task-owner','1');
+    }
+    return {node,rawIdx:markerRawIdx,kind};
+  };
+  const preWindowCompactionCards=compactionPlacements.preWindowMarkers.map(markerRawIdx=>_compactionCardEntry(markerRawIdx,'pre-window'));
+  const compactionCardNodes=compactionPlacements.inlineMarkers.map(markerRawIdx=>_compactionCardEntry(markerRawIdx,'inline'));
+  const referenceNode=showCurrentSummaryFallback
+    ? (()=>{const row=document.createElement('div');row.innerHTML=`<div class="compression-turn"><div class="compression-turn-blocks">${_compressionReferenceCardHtml(referenceText,false)}${referenceNodeOwnsTasks?_preservedCompressionTaskListCardsHtml(preservedCompressionTaskMessages):''}</div></div>`;const node=row.firstElementChild;if(node&&referenceNodeOwnsTasks) node.setAttribute('data-compaction-task-owner','1');return node;})()
     : null;
-  let preservedCompressionTaskCardsAttached=!!referenceNode;
+  let referenceNodePinnedAtTop=false;
+  let preservedCompressionTaskOwnerNode=null;
   const preservedCompressionRawIdxs=[];
   let rawIdx=0;
   for(const m of S.messages){
@@ -16118,7 +17169,17 @@ function renderMessages(options){
     if(_isPreservedCompressionTaskListMessage(m)){preservedCompressionRawIdxs.push(rawIdx);rawIdx++;continue;}
     rawIdx++;
   }
-  const firstRenderedRawIdx=renderVisWithIdx.length?renderVisWithIdx[0].rawIdx:Infinity;
+  // #6999: the turn-content maps MUST see the FULL visWithIdx, not the
+  // virtual render window. _assistantTurnFinalVisibleContentMap /
+  // _assistantTurnVisibleContentMap derive the echo-strip context for a
+  // rendered assistant row from ALL assistant siblings of its turn
+  // (ui.js:10783-10830). Windowed-out siblings are still input context even
+  // though their own rows are not read: cutting through an assistant run
+  // loses the final/visible answer used to strip reasoning echoes, and
+  // concatenating head+tail across an omitted user boundary would merge
+  // distinct turns into one run (duplicate final-answer in Worklog/Thinking,
+  // or later-turn prose used as an echo-strip input). Turn context must
+  // always be complete — never cut mid-run, never head+tail with a gap.
   const assistantTurnFinalVisibleContentByRawIdx=_assistantTurnFinalVisibleContentMap(visWithIdx);
   const assistantTurnVisibleContentByRawIdx=_assistantTurnVisibleContentMap(visWithIdx);
   const hasServerOlder=!!(typeof _messagesTruncated!=='undefined' && _messagesTruncated && S.messages.length>0);
@@ -16137,7 +17198,19 @@ function renderMessages(options){
       : (typeof t==='function'?t('load_older_messages'):'Load earlier messages');
     inner.appendChild(indicator);
     _wireMessageWindowLoadEarlierButton();
+    // Keep the settled compacted-context card immediately visible in a long,
+    // tail-loaded conversation. Put it in flow (not inside an old tool turn).
+    referenceNodePinnedAtTop=_pinSettledCompressionReferenceAtTop(inner,referenceNode,referenceMessageRawIdx);
+    if(referenceNodePinnedAtTop&&referenceNode?.parentElement&&referenceNodeOwnsTasks){
+      preservedCompressionTaskOwnerNode=referenceNode;
+    }
   }
+  const preWindowInsertion=_insertCompactionCardNodes(
+    preWindowCompactionCards,
+    compactionPlacements.taskOwner,
+    node=>_pinCompactionCardAtTop(inner,node)
+  );
+  if(preWindowInsertion.taskOwnerNode) preservedCompressionTaskOwnerNode=preWindowInsertion.taskOwnerNode;
   let lastUserRawIdx=-1;
   for(let i=visWithIdx.length-1;i>=0;i--){
     if(visWithIdx[i].m&&visWithIdx[i].m.role==='user'){
@@ -16378,6 +17451,13 @@ function renderMessages(options){
       }).join('')}</div>`;
     }
     let bodyHtml = _getCachedRender(displayContent, isUser);
+    // Message-level media snapshots: settled assistant messages carry a
+    // path→digest map (written at settle time) freezing the file bytes the
+    // turn emitted. Stamp it AFTER the text-keyed render cache so identical
+    // text with different snapshots (old/new comparison) never collides.
+    if(!isUser && m && m._media_snapshots && typeof m._media_snapshots==='object'){
+      bodyHtml = _stampMediaSnapshots(bodyHtml, m._media_snapshots);
+    }
     if(!isUser&&m.provider_details){
       const summary=m.provider_details_label||'Provider details';
       bodyHtml += `<details class="provider-error-details"><summary>${esc(String(summary))}</summary><pre><code>${esc(String(m.provider_details))}</code></pre></details>`;
@@ -16598,10 +17678,15 @@ function renderMessages(options){
         if(!firstSeg&&thinkingText&&window._showThinking!==false&&!((isCompactWorklogMode()||isTransparentStream())&&_assistantThinkingBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs))) orderedSeg.insertAdjacentHTML('beforeend', _thinkingCardHtml(thinkingText));
         const isLastTextPart=partIdx===lastTextPartIdx;
         const partBodyHtml=_getCachedRender(partDisplayText,false);
+        // Message-level media snapshots: transparent ordered segments carry the
+        // same per-message path→digest map as the main transcript; stamp it so
+        // historical previews freeze (&snap=) instead of following overwrites.
+        // Inlined in the template (no intermediate variable) so test-harness
+        // block extraction of the ordered-segment slice stays self-contained.
         if(isLastTextPart&&statusHtml){
           orderedSeg.insertAdjacentHTML('beforeend', statusHtml);
         }
-        orderedSeg.insertAdjacentHTML('beforeend', `${isLastTextPart?filesHtml:''}<div class="msg-body">${partBodyHtml}</div>${isLastTextPart?footHtml:''}`);
+        orderedSeg.insertAdjacentHTML('beforeend', `${isLastTextPart?filesHtml:''}<div class="msg-body">${(typeof m!=='undefined'&&m&&m._media_snapshots&&typeof m._media_snapshots==='object')?_stampMediaSnapshots(partBodyHtml,m._media_snapshots):partBodyHtml}</div>${isLastTextPart?footHtml:''}`);
         blocks.appendChild(orderedSeg);
         if(!firstSeg) firstSeg=orderedSeg;
       });
@@ -16672,7 +17757,7 @@ function renderMessages(options){
   }
 
   function _insertCompressionLikeNode(node, anchorIndex){
-    if(!node) return;
+    if(!node) return false;
     const anchorIdx=anchorIndex===undefined?insertionAnchor:anchorIndex;
     if(anchorIdx!==null && renderVisWithIdx[anchorIdx]){
       const anchorRawIdx=renderVisWithIdx[anchorIdx].rawIdx;
@@ -16682,23 +17767,24 @@ function renderMessages(options){
         const blocks=_assistantTurnBlocks(turn);
         if(blocks){
           blocks.appendChild(node);
-          return;
+          return !!node.parentElement;
         }
       }
       const userRow=userRows.get(anchorRawIdx);
       if(userRow && userRow.parentElement){
         userRow.parentElement.insertBefore(node, userRow.nextSibling);
-        return;
+        return !!node.parentElement;
       }
     }
     inner.appendChild(node);
+    return !!node.parentElement;
   }
   function _insertCompressionLikeNodeByRawIdx(node, rawIdx){
-    if(!node) return;
-    if(rawIdx<firstRenderedRawIdx) return;
+    if(!node) return false;
+    if(rawIdx<firstRenderedRawIdx) return false;
     if(!renderVisWithIdx.length){
       inner.appendChild(node);
-      return;
+      return !!node.parentElement;
     }
     let anchorIdx=null;
     for(let i=0;i<renderVisWithIdx.length;i++){
@@ -16709,7 +17795,7 @@ function renderMessages(options){
     }
     if(anchorIdx===null){
       inner.appendChild(node);
-      return;
+      return !!node.parentElement;
     }
     const anchorRawIdx=renderVisWithIdx[anchorIdx].rawIdx;
     const anchorSeg=assistantSegments.get(anchorRawIdx);
@@ -16718,23 +17804,24 @@ function renderMessages(options){
       const blocks=_assistantTurnBlocks(turn);
       if(blocks){
         blocks.insertBefore(node, anchorSeg);
-        return;
+        return !!node.parentElement;
       }
       const turnParent=turn && turn.parentElement;
       if(turnParent){
         turnParent.insertBefore(node, turn);
-        return;
+        return !!node.parentElement;
       }
     }
     const userRow=userRows.get(anchorRawIdx);
     if(userRow && userRow.parentElement){
       userRow.parentElement.insertBefore(node, userRow);
-      return;
+      return !!node.parentElement;
     }
     inner.appendChild(node);
+    return !!node.parentElement;
   }
-  const preservedOnlyNode=(!preservedCompressionTaskCardsAttached&&(!referenceNode||compressionState)&&preservedCompressionTaskMessages.length)
-    ? (()=>{const row=document.createElement('div');row.innerHTML=`<div class="compression-turn"><div class="compression-turn-blocks">${_preservedCompressionTaskListCardsHtml(preservedCompressionTaskMessages)}</div></div>`;return row.firstElementChild;})()
+  const preservedOnlyNode=preservedCompressionTaskMessages.length
+    ? (()=>{const row=document.createElement('div');row.innerHTML=`<div class="compression-turn" data-compaction-task-fallback="1"><div class="compression-turn-blocks">${_preservedCompressionTaskListCardsHtml(preservedCompressionTaskMessages)}</div></div>`;return row.firstElementChild;})()
     : null;
   const preservedOnlyAnchor=preservedCompressionRawIdxs.length
     ? (()=>{let idx=null;for(let i=0;i<renderVisWithIdx.length;i++){if(renderVisWithIdx[i].rawIdx<preservedCompressionRawIdxs[0]) idx=i;}return idx;})()
@@ -16742,9 +17829,25 @@ function renderMessages(options){
   const handoffSummaryStates=_collectHandoffSummaryStates(S.messages);
 
   _insertCompressionLikeNode(compressionNode);
-  if(referenceNode&&referenceMessageRawIdx>=0) _insertCompressionLikeNodeByRawIdx(referenceNode, referenceMessageRawIdx);
-  else _insertCompressionLikeNode(referenceNode);
-  _insertCompressionLikeNode(preservedOnlyNode, preservedOnlyAnchor);
+  const inlineCompactionInsertion=_insertCompactionCardNodes(
+    compactionCardNodes,
+    compactionPlacements.taskOwner,
+    (node,markerRawIdx)=>_insertCompressionLikeNodeByRawIdx(node,markerRawIdx)
+  );
+  if(inlineCompactionInsertion.taskOwnerNode) preservedCompressionTaskOwnerNode=inlineCompactionInsertion.taskOwnerNode;
+  if(!referenceNodePinnedAtTop){
+    const referenceInserted=referenceNode&&referenceMessageRawIdx>=0
+      ?_insertCompressionLikeNodeByRawIdx(referenceNode,referenceMessageRawIdx)
+      :_insertCompressionLikeNode(referenceNode);
+    if(referenceInserted&&referenceNode?.parentElement&&referenceNodeOwnsTasks){
+      preservedCompressionTaskOwnerNode=referenceNode;
+    }
+  }
+  _insertPreservedCompressionTaskFallback(
+    preservedCompressionTaskOwnerNode,
+    preservedOnlyNode,
+    node=>_insertCompressionLikeNode(node,preservedOnlyAnchor)
+  );
   _insertCompressionLikeNode(handoffState?_handoffCardsNode(handoffState):null, renderVisWithIdx.length?renderVisWithIdx.length-1:null);
   for(const entry of handoffSummaryStates){
     if(!entry||!entry.state) continue;
@@ -18646,66 +19749,88 @@ function autoResizeTextarea(ta) {
   ta.style.height = Math.min(ta.scrollHeight, 300) + 'px';
 }
 
+// #2184 follow-up: submitEdit is re-entrant and destructive, and nothing stopped
+// a second invocation. Its only guard was S.busy, which send() does not set until
+// the LAST line — after two multi-second awaits (_ensureAllMessagesLoaded on a long
+// session, then the truncate round-trip). On a laggy instance that leaves a 10s+
+// window in which every further click on "Send edit" starts another full truncate.
+// Observed in the wild: seven concurrent POST /api/session/truncate, 5.2-8.5s each,
+// from one user clicking repeatedly because the UI had not yet acknowledged the first.
+//
+// That is not merely wasteful, it is a data-loss hazard. `absoluteKeepCount` is
+// deliberately captured BEFORE the awaits (see test_submit_edit_captures_absolute_
+// before_await): at click time `_oldestIdx` is the loaded window's offset and
+// `msgIdx` is window-relative, so their sum is the true absolute index. But the
+// first call's _ensureAllMessagesLoaded() sets `_oldestIdx = 0`, so a SECOND call
+// entering afterwards computes `0 + msgIdx` from a still-window-relative msgIdx —
+// a far smaller keep_count. Truncating a 2000-message session to that would delete
+// most of its history.
+//
+// Guard re-entry at the function itself rather than at the click handler: the edit
+// can also be submitted with Enter (the keydown handler clicks the button), and a
+// future caller would silently reopen the hole. Cleared in a finally so an early
+// return or a throw cannot wedge editing off for the rest of the page's life.
+let _submitEditInFlight = false;
 async function submitEdit(msgIdx, newText) {
-  if(!S.session || S.busy) return;
-  const initialSid = S.session.session_id;
-  const absoluteKeepCount = _oldestIdx + msgIdx;
-  // #5924: capture the deliberate-pick signal up front (pre-network), scoped to
-  // initialSid — a non-default session model (vs profile default), which is
-  // inference-free and survives the failed send's marker consumption. See
-  // _deliberateSessionModelPick. null → no re-arm → server resolution runs.
-  const _recoveryPick=_deliberateSessionModelPick(initialSid);
-  if(typeof _ensureAllMessagesLoaded==='function'){
-    await _ensureAllMessagesLoaded();
-  }
-  if(!S.session || S.session.session_id !== initialSid) return;
+  if(!S.session || S.busy || _submitEditInFlight) return;
+  _submitEditInFlight = true;
   try {
-    await api('/api/session/truncate', {method:'POST', body:JSON.stringify({
-      session_id: initialSid,
-      keep_count: absoluteKeepCount
-    })});
-    // #5924 SILENT-race guard: a session switch during the truncate await must not
-    // let this recovery apply session A's intent (truncate/re-arm/send) to the
-    // newly-visible session.
+    const initialSid = S.session.session_id;
+    const absoluteKeepCount = _oldestIdx + msgIdx;
+    // #5924: capture the deliberate-pick signal up front (pre-network), scoped to
+    // initialSid — a non-default session model (vs profile default), which is
+    // inference-free and survives the failed send's marker consumption. See
+    // _deliberateSessionModelPick. null → no re-arm → server resolution runs.
+    const _recoveryPick=_deliberateSessionModelPick(initialSid);
+    if(typeof _ensureAllMessagesLoaded==='function'){
+      await _ensureAllMessagesLoaded();
+    }
     if(!S.session || S.session.session_id !== initialSid) return;
-    S.messages = S.messages.slice(0, absoluteKeepCount);
-    renderMessages();
-    $('msg').value = newText;
-    // #5924 (Facet 1 + Facet 4): edit-resubmit is a recovery send. Re-arm the
-    // Re-arm the single-shot explicit-pick marker from the captured non-default
-    // pick — only if still safe at fire time (session unchanged, current model
-    // still matches, no newer onchange marker to clobber). See _reArmRecoveryPick.
-    _reArmRecoveryPick(initialSid, _recoveryPick);
-    await send();
-  } catch(e) { setStatus(t('edit_failed') + e.message); }
+    try {
+      await api('/api/session/truncate', {method:'POST', body:JSON.stringify({
+        session_id: initialSid,
+        keep_count: absoluteKeepCount
+      })});
+      // #5924 SILENT-race guard: a session switch during the truncate await must not
+      // let this recovery apply session A's intent (truncate/re-arm/send) to the
+      // newly-visible session.
+      if(!S.session || S.session.session_id !== initialSid) return;
+      S.messages = S.messages.slice(0, absoluteKeepCount);
+      renderMessages();
+      $('msg').value = newText;
+      // #5924 (Facet 1 + Facet 4): edit-resubmit is a recovery send. Re-arm the
+      // Re-arm the single-shot explicit-pick marker from the captured non-default
+      // pick — only if still safe at fire time (session unchanged, current model
+      // still matches, no newer onchange marker to clobber). See _reArmRecoveryPick.
+      _reArmRecoveryPick(initialSid, _recoveryPick);
+      await send();
+    } catch(e) { setStatus(t('edit_failed') + e.message); }
+  } finally {
+    _submitEditInFlight = false;
+  }
 }
 
 async function regenerateResponse(btn) {
   if(!S.session || S.busy) return;
-  const row = btn.closest('[data-msg-idx]');
-  if(!row) return;
-  const assistantIdx = parseInt(row.dataset.msgIdx, 10);
-  const absoluteKeepCount = _oldestIdx + assistantIdx;
+  const row=btn&&btn.closest&&btn.closest('[data-msg-idx]');
+  if(!row)return;
+  const clickedAbsoluteIndex=_oldestIdx+parseInt(row.dataset.msgIdx,10);
   const initialSid = S.session.session_id;
-  let lastUserText = '';
-  for(let i = assistantIdx - 1; i >= 0; i--) {
-    const m = S.messages[i];
-    if(m && m.role === 'user') { lastUserText = msgContent(m); break; }
-  }
-  if(!lastUserText) return;
   if(typeof _ensureAllMessagesLoaded==='function'){
     await _ensureAllMessagesLoaded();
   }
   if(!S.session || S.session.session_id !== initialSid) return;
+  if(!S.session.regeneration_revision){ setStatus(t('regen_failed')); return; }
+  let latestAssistantIndex=-1;
+  for(let i=S.messages.length-1;i>=0;i--){
+    if(S.messages[i]?.role==='assistant'){latestAssistantIndex=i;break;}
+  }
+  if(clickedAbsoluteIndex!==latestAssistantIndex){
+    setStatus(t('regen_failed'));
+    return;
+  }
   try {
-    await api('/api/session/truncate', {method:'POST', body:JSON.stringify({
-      session_id: initialSid,
-      keep_count: absoluteKeepCount
-    })});
-    S.messages = S.messages.slice(0, absoluteKeepCount);
-    renderMessages();
-    $('msg').value = lastUserText;
-    await send();
+    await startRegeneration(initialSid, S.session.regeneration_revision);
   } catch(e) { setStatus(t('regen_failed') + e.message); }
 }
 
@@ -18979,7 +20104,8 @@ function loadDiffInline(container){
   root.querySelectorAll('.diff-inline-load:not([data-loaded])').forEach(el=>{
     el.setAttribute('data-loaded','1');
     const path=el.dataset.path;
-    fetch('api/media?path='+encodeURIComponent(path))
+    const snapQuery=_mediaSnapQuery(el);
+    fetch('api/media?path='+encodeURIComponent(path)+snapQuery)
       .then(r=>{if(!r.ok) throw new Error(r.status);return r.text();})
       .then(text=>{
         if(text.length>DIFF_MAX_SIZE){
@@ -19008,8 +20134,18 @@ function _mediaSessionQuery(){
   return mediaSessionId?'&session_id='+encodeURIComponent(mediaSessionId):'';
 }
 
+// Message-level media snapshots: lazy preview loaders (pdf/html/csv/diff/
+// excalidraw) build their fetch URL from data-path at load time. The stamping
+// pass in _stampMediaSnapshots carries the content digest in data-snap;
+// append it here so the preview shows the file as the message emitted it.
+function _mediaSnapQuery(el){
+  const snap=el&&el.dataset?el.dataset.snap:'';
+  return (snap&&/^[0-9a-f]{64}$/.test(snap))?('&snap='+snap):'';
+}
+
 function _csvMediaUrl(path, opts={}){
   let url='api/media?path='+encodeURIComponent(path)+_mediaSessionQuery();
+  if(opts.snap) url+='&snap='+encodeURIComponent(opts.snap);
   if(opts.download) url+='&download=1';
   return url;
 }
@@ -19049,8 +20185,9 @@ function loadCsvInline(container){
   root.querySelectorAll('.csv-inline-load:not([data-loaded])').forEach(el=>{
     el.setAttribute('data-loaded','1');
     const path=el.dataset.path;
-    const mediaUrl=_csvMediaUrl(path);
-    const downloadUrl=_csvMediaUrl(path,{download:true});
+    const snap=_mediaSnapQuery(el).replace(/^&snap=/,'');
+    const mediaUrl=_csvMediaUrl(path,{snap:snap||undefined});
+    const downloadUrl=_csvMediaUrl(path,{download:true,snap:snap||undefined});
     fetch(mediaUrl)
       .then(r=>{if(!r.ok) throw new Error(r.status);return r.text();})
       .then(text=>{
@@ -19069,7 +20206,8 @@ function loadExcalidrawInline(container){
   root.querySelectorAll('.excalidraw-inline-load:not([data-loaded])').forEach(el=>{
     el.setAttribute('data-loaded','1');
     const path=el.dataset.path;
-    fetch('api/media?path='+encodeURIComponent(path))
+    const snapQuery=_mediaSnapQuery(el);
+    fetch('api/media?path='+encodeURIComponent(path)+snapQuery)
       .then(r=>{if(!r.ok) throw new Error(r.status);return r.text();})
       .then(text=>{
         if(text.length>EXCALIDRAW_MAX_SIZE){
@@ -19198,14 +20336,15 @@ function loadPdfInline(container){
     const path=el.dataset.path;
     const fname=path.split('/').pop()||path;
     const mediaSessionId=(typeof S!=='undefined'&&S&&S.session&&S.session.session_id)?String(S.session.session_id):'';
+    const snapQuery=_mediaSnapQuery(el);
     const publicMediaUrl='api/media?path='+encodeURIComponent(path);
-    const mediaUrl=publicMediaUrl+(mediaSessionId?'&session_id='+encodeURIComponent(mediaSessionId):'');
+    const mediaUrl=publicMediaUrl+(mediaSessionId?'&session_id='+encodeURIComponent(mediaSessionId):'')+snapQuery;
     const loadPdf=(pdfjsLib)=>{
       fetch(mediaUrl)
         .then(r=>{if(!r.ok) throw new Error(r.status); return r.arrayBuffer();})
         .then(buf=>{
           if(buf.byteLength>PDF_MAX_SIZE){
-            const dlUrl=publicMediaUrl+'&download=1';
+            const dlUrl=publicMediaUrl+'&download=1'+snapQuery;
             el.outerHTML=`<div class="pdf-preview-fallback"><a class="msg-media-link" href="${dlUrl}" download="${esc(fname)}">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('pdf_too_large')}</span></div>`;
             return;
           }
@@ -19213,7 +20352,7 @@ function loadPdfInline(container){
         })
         .then(pdf=>{
           if(!pdf) return;
-          const dlUrl=publicMediaUrl+'&download=1';
+          const dlUrl=publicMediaUrl+'&download=1'+snapQuery;
           const total=pdf.numPages;
           const pagesLabel=total>1?` · ${total} pages`:'';
           const wrap=document.createElement('div');
@@ -19252,7 +20391,7 @@ function loadPdfInline(container){
           renderPage(1);
         })
         .catch(()=>{
-          const dlUrl=publicMediaUrl+'&download=1';
+          const dlUrl=publicMediaUrl+'&download=1'+snapQuery;
           el.outerHTML=`<div class="pdf-preview-fallback"><a class="msg-media-link" href="${dlUrl}" download="${esc(fname)}">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('pdf_error')}</span></div>`;
         });
     };
@@ -19272,7 +20411,7 @@ function loadPdfInline(container){
       window.addEventListener('pdfjs-ready',()=>{ _pdfjsReady=true; loadPdf(window._pdfjsLib); },{once:true});
       setTimeout(()=>{
         if(!_pdfjsReady){
-          const dlUrl=publicMediaUrl+'&download=1';
+          const dlUrl=publicMediaUrl+'&download=1'+snapQuery;
           if(el.parentNode){
             el.outerHTML=`<div class="pdf-preview-fallback"><a class="msg-media-link" href="${dlUrl}" download="${esc(fname)}">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('pdf_error')}</span></div>`;
           }
@@ -19293,22 +20432,23 @@ function loadHtmlInline(container){
     const path=el.dataset.path;
     const fname=path.split('/').pop()||path;
     const mediaSessionId=(typeof S!=='undefined'&&S&&S.session&&S.session.session_id)?String(S.session.session_id):'';
+    const snapQuery=_mediaSnapQuery(el);
     const publicMediaUrl='api/media?path='+encodeURIComponent(path);
-    const mediaUrl=publicMediaUrl+(mediaSessionId?'&session_id='+encodeURIComponent(mediaSessionId):'');
+    const mediaUrl=publicMediaUrl+(mediaSessionId?'&session_id='+encodeURIComponent(mediaSessionId):'')+snapQuery;
     fetch(mediaUrl, {cache:'no-store'})
       .then(r=>{if(!r.ok) throw new Error(r.status); return r.text();})
       .then(html=>{
         if(html.length>HTML_MAX_SIZE){
-          const openUrl=publicMediaUrl+'&inline=1';
+          const openUrl=publicMediaUrl+'&inline=1'+snapQuery;
           el.outerHTML=`<div class="html-preview-fallback"><a class="msg-media-link" href="${openUrl}" target="_blank" rel="noopener">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('html_too_large')}</span></div>`;
           return;
         }
-        const openUrl=publicMediaUrl+'&inline=1';
+        const openUrl=publicMediaUrl+'&inline=1'+snapQuery;
         const safeHtml=html.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
         el.outerHTML=`<div class="html-preview-wrap"><div class="html-preview-header"><span>${t('html_sandbox_label')}</span><a href="${openUrl}" target="_blank" rel="noopener" class="html-open-link">${t('html_open_full')} ↗</a></div><iframe srcdoc="${safeHtml}" sandbox="allow-scripts" class="html-preview-iframe" loading="lazy"></iframe></div>`;
       })
       .catch(()=>{
-        const dlUrl=publicMediaUrl+'&download=1';
+        const dlUrl=publicMediaUrl+'&download=1'+snapQuery;
         el.outerHTML=`<div class="html-preview-fallback"><a class="msg-media-link" href="${dlUrl}" download="${esc(fname)}">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('html_error')}</span></div>`;
       });
   });
@@ -19740,22 +20880,123 @@ function _visibleWorkspaceEntries(entries){
   const list=Array.isArray(entries)?entries:[];
   return S.showHiddenWorkspaceFiles?list:list.filter(item=>!_workspaceShouldHideEntry(item));
 }
+const WORKSPACE_SORT_KEYS=['name-asc','name-desc','created-desc','modified-desc'];
+const WORKSPACE_SORT_DEFAULT='name-asc';
+function _normalizeWorkspaceSortKey(value){
+  return WORKSPACE_SORT_KEYS.includes(value)?value:WORKSPACE_SORT_DEFAULT;
+}
+function _workspaceEntryRank(item){
+  const rank=item&&item.workspace_sort_rank;
+  return rank===0||rank===1||rank===2?rank:1;
+}
+function _workspaceEntryTimestampKey(item,field){
+  const raw=item&&item[field];
+  if(typeof raw==='string'){
+    const value=raw.trim();
+    if(!/^[+-]?\d+$/.test(value))return null;
+    const negative=value[0]==='-';
+    const digits=value.replace(/^[+-]/,'').replace(/^0+(?=\d)/,'');
+    if(digits==='0')return '0';
+    return negative?'-'+digits:digits;
+  }
+  if(typeof raw==='number') return Number.isInteger(raw)?String(raw):null;
+  if(typeof raw==='bigint') return String(raw);
+  return null;
+}
+function _compareWorkspaceTimestampDesc(a,b,field){
+  const av=_workspaceEntryTimestampKey(a,field),bv=_workspaceEntryTimestampKey(b,field);
+  if(av==null&&bv==null)return 0;
+  if(av==null)return 1;
+  if(bv==null)return -1;
+  const an=av[0]==='-',bn=bv[0]==='-';
+  if(an!==bn)return an?1:-1;
+  const aa=an?av.slice(1):av,bb=bn?bv.slice(1):bv;
+  if(aa.length!==bb.length)return an?aa.length-bb.length:bb.length-aa.length;
+  return aa===bb?0:(an?(aa<bb?-1:1):(aa<bb?1:-1));
+}
+function _workspaceSortComparator(key){
+  if(key==='name-desc') return (a,b)=>String(b.name||'').toLowerCase().localeCompare(String(a.name||'').toLowerCase());
+  const field=key==='created-desc'?'birthtime_ns':'mtime_ns';
+  return (a,b)=>_compareWorkspaceTimestampDesc(a,b,field);
+}
+function _workspaceCreatedSortAvailable(){return !!(S.session&&S.session.workspace&&S._workspaceBirthtimeSeen);}
+function _effectiveWorkspaceSortKey(){
+  const key=_normalizeWorkspaceSortKey(S.workspaceSortKey);
+  return key==='created-desc'&&!_workspaceCreatedSortAvailable()?WORKSPACE_SORT_DEFAULT:key;
+}
+function _workspaceEntriesForRender(entries){
+  const list=_visibleWorkspaceEntries(entries);
+  const key=_effectiveWorkspaceSortKey();
+  if(key===WORKSPACE_SORT_DEFAULT)return list;
+  const cmp=_workspaceSortComparator(key);
+  return list.slice().sort((a,b)=>{
+    const rank=_workspaceEntryRank(a)-_workspaceEntryRank(b);
+    return rank!==0?rank:cmp(a,b);
+  });
+}
+function _resetWorkspaceBirthtimeSupport(scope=''){
+  S._workspaceBirthtimeSeen=false;
+  S._workspaceBirthtimeWorkspace=String(scope||'');
+  _syncWorkspacePrefsIndicators();
+  _syncWorkspaceSortMenuState();
+}
+function _syncWorkspaceBirthtimeSupportScope(scope=''){
+  const next=String(scope||'');
+  if(S._workspaceBirthtimeWorkspace!==next) _resetWorkspaceBirthtimeSupport(next);
+}
+function _noteWorkspaceBirthtimeSupport(entries){
+  if(S._workspaceBirthtimeSeen)return;
+  if((Array.isArray(entries)?entries:[]).some(e=>_workspaceEntryTimestampKey(e,'birthtime_ns')!==null)){
+    S._workspaceBirthtimeSeen=true;
+    S._workspaceBirthtimeWorkspace=String((S.session&&S.session.workspace)||S._workspaceBirthtimeWorkspace||'');
+    _syncWorkspacePrefsIndicators();
+    _syncWorkspaceSortMenuState();
+  }
+}
+function _syncWorkspacePrefsIndicators(ind=$('workspaceHiddenIndicator'),dot=$('workspacePrefsDot')){
+  if(ind){
+    if(S.showHiddenWorkspaceFiles){ind.hidden=false;ind.removeAttribute('hidden');}
+    else{ind.hidden=true;ind.setAttribute('hidden','');}
+  }
+  if(dot){
+    const active=S.showHiddenWorkspaceFiles||_effectiveWorkspaceSortKey()!==WORKSPACE_SORT_DEFAULT;
+    if(active){dot.hidden=false;dot.removeAttribute('hidden');}
+    else{dot.hidden=true;dot.setAttribute('hidden','');}
+  }
+}
+function _syncWorkspaceSortMenuState(menu=_workspacePrefsMenu){
+  if(!menu||!menu.querySelectorAll)return;
+  const active=_effectiveWorkspaceSortKey();
+  const createdOk=_workspaceCreatedSortAvailable();
+  menu.querySelectorAll('.workspace-prefs-item--radio').forEach(row=>{
+    const input=row&&row.querySelector?row.querySelector('input[name="workspaceSortKey"]'):null;
+    if(!input)return;
+    const checked=input.value===active;
+    const disabled=input.value==='created-desc'&&!createdOk;
+    input.checked=checked;
+    input.disabled=disabled;
+    row.setAttribute('aria-checked',checked?'true':'false');
+    row.setAttribute('aria-disabled',disabled?'true':'false');
+    if(row.classList&&row.classList.toggle) row.classList.toggle('is-disabled',disabled);
+    if(input.value==='created-desc'){
+      const copy=row.querySelector('.workspace-prefs-copy');
+      let meta=row.querySelector('.workspace-prefs-meta');
+      if(disabled){
+        if(!meta&&copy&&typeof document!=='undefined'){
+          meta=document.createElement('span');
+          meta.className='workspace-prefs-meta';
+          copy.appendChild(meta);
+        }
+        if(meta)meta.textContent=typeof t==='function'?t('workspace_sort_created_unavailable'):'Creation time is not reported by this server or platform.';
+      }else if(meta)meta.remove();
+    }
+  });
+  if(menu===_workspacePrefsMenu&&typeof _workspacePrefsAnchor!=='undefined'&&_workspacePrefsAnchor&&typeof _positionWorkspacePrefsMenu==='function') _positionWorkspacePrefsMenu(_workspacePrefsAnchor);
+}
 function _syncWorkspaceHiddenToggle(){
   const el=$('workspaceShowHiddenFiles');
   if(el)el.checked=!!S.showHiddenWorkspaceFiles;
-  // Reflect "hidden files are visible" state on the panel heading + kebab dot,
-  // so users can see they've flipped a non-default workspace pref without
-  // having to open the menu. The menu itself stays out of the way otherwise.
-  const ind=$('workspaceHiddenIndicator');
-  if(ind){
-    if(S.showHiddenWorkspaceFiles){ ind.hidden=false; ind.removeAttribute('hidden'); }
-    else { ind.hidden=true; ind.setAttribute('hidden',''); }
-  }
-  const dot=$('workspacePrefsDot');
-  if(dot){
-    if(S.showHiddenWorkspaceFiles){ dot.hidden=false; dot.removeAttribute('hidden'); }
-    else { dot.hidden=true; dot.setAttribute('hidden',''); }
-  }
+  _syncWorkspacePrefsIndicators($('workspaceHiddenIndicator'),$('workspacePrefsDot'));
 }
 function toggleWorkspaceHiddenFiles(value){
   S.showHiddenWorkspaceFiles=!!value;
@@ -19764,6 +21005,14 @@ function toggleWorkspaceHiddenFiles(value){
   renderFileTree();
 }
 try{S.showHiddenWorkspaceFiles=localStorage.getItem('hermes-workspace-show-hidden-files')==='1';}catch(_){}
+try{S.workspaceSortKey=_normalizeWorkspaceSortKey(localStorage.getItem('hermes-workspace-sort-key'));}catch(_){S.workspaceSortKey=WORKSPACE_SORT_DEFAULT;}
+function setWorkspaceSortKey(value){
+  S.workspaceSortKey=_normalizeWorkspaceSortKey(value);
+  try{localStorage.setItem('hermes-workspace-sort-key',S.workspaceSortKey);}catch(_){ }
+  _syncWorkspacePrefsIndicators();
+  _syncWorkspaceSortMenuState();
+  renderFileTree();
+}
 
 // ── Workspace preferences kebab menu (#1793 UX refinement) ───────────────
 // The "Show hidden files" toggle used to live as a permanent inline row
@@ -19801,6 +21050,35 @@ function _buildWorkspacePrefsMenu(){
   const menu=document.createElement('div');
   menu.className='workspace-prefs-menu open';
   menu.setAttribute('role','menu');
+  const group=document.createElement('div');
+  group.className='workspace-prefs-group';
+  group.setAttribute('role','group');
+  const groupLabel=(typeof t==='function'?t('workspace_sort_by'):'Sort by');
+  group.setAttribute('aria-label',groupLabel);
+  const head=document.createElement('div');
+  head.className='workspace-prefs-grouplabel';
+  head.textContent=groupLabel;
+  group.appendChild(head);
+  const createdOk=_workspaceCreatedSortAvailable();
+  const active=_effectiveWorkspaceSortKey();
+  [['name-asc','workspace_sort_name_asc'],['name-desc','workspace_sort_name_desc'],['created-desc','workspace_sort_created_desc'],['modified-desc','workspace_sort_modified_desc']].forEach(([key,i18nKey])=>{
+    const disabled=key==='created-desc'&&!createdOk;
+    const row=document.createElement('label');
+    row.className='workspace-prefs-item workspace-prefs-item--radio'+(disabled?' is-disabled':'');
+    row.setAttribute('role','menuitemradio');
+    row.setAttribute('aria-checked',active===key?'true':'false');
+    row.setAttribute('aria-disabled',disabled?'true':'false');
+    row.innerHTML='<input type="radio" name="workspaceSortKey" value="'+esc(key)+'" id="workspaceSort_'+esc(key)+'"'+(disabled?' disabled':'')+' onchange="setWorkspaceSortKey(this.value)">'+
+      '<span class="workspace-prefs-copy"><span class="workspace-prefs-name">'+esc(typeof t==='function'?t(i18nKey):key)+'</span>'+
+      (disabled?'<span class="workspace-prefs-meta">'+esc(typeof t==='function'?t('workspace_sort_created_unavailable'):'Creation time is not reported by this server or platform.')+'</span>':'')+'</span>';
+    const input=row.querySelector('input');
+    if(input)input.checked=active===key;
+    group.appendChild(row);
+  });
+  menu.appendChild(group);
+  const sep=document.createElement('div');
+  sep.className='workspace-prefs-sep';
+  menu.appendChild(sep);
   // The checkbox keeps id="workspaceShowHiddenFiles" so existing call
   // sites (and the existing test_issue1793_file_tree_cruft_filter test)
   // can find it the same way as before. Only the parent container moves.
@@ -20020,13 +21298,15 @@ function renderFileTree(){
   const emptyEl=$('wsEmptyState');
   const hasWorkspace=!!(S.session&&S.session.workspace);
   if(!hasWorkspace){
+    _syncWorkspaceBirthtimeSupportScope('');
     if(emptyEl){emptyEl.textContent=t('workspace_empty_no_path');emptyEl.style.display='flex';}
     box.style.display='none';
     return;
   }
+  _noteWorkspaceBirthtimeSupport(S.entries);
   if(emptyEl) emptyEl.style.display='none';
   box.style.display='';
-  const visibleEntries=_visibleWorkspaceEntries(S.entries);
+  const visibleEntries=_workspaceEntriesForRender(S.entries);
   if(!visibleEntries.length){
     if(emptyEl){emptyEl.textContent=t('workspace_empty_dir');emptyEl.style.display='flex';}
     return;
@@ -20414,7 +21694,7 @@ function _renderTreeItems(container, entries, depth){
 
     // Render children if directory is expanded
     if(isDirLike&&S._expandedDirs.has(item.path)){
-      const children=_visibleWorkspaceEntries(S._dirCache[item.path]||[]);
+      const children=_workspaceEntriesForRender(S._dirCache[item.path]||[]);
       if(children.length){
         _renderTreeItems(container, children, depth+1);
       }else{
@@ -20649,7 +21929,7 @@ async function promptNewFile(targetDir = S.currentDir || '.'){
       // System-minted session (#6022): explicit worktree:false — creating a
       // file from a blank page must not inherit the config worktree default.
       const r=await api('/api/session/new',{method:'POST',body:JSON.stringify({workspace:ws,worktree:false})});
-      if(r&&r.session){S._pendingSessionToolsets=null;S.session=r.session;S.messages=[];syncTopbar();renderMessages();await renderSessionList();}
+      if(r&&r.session){S._pendingSessionToolsets=null;S.session=r.session;if(typeof _adoptRegenerationRevision==='function') _adoptRegenerationRevision(r.session);S.messages=[];syncTopbar();renderMessages();await renderSessionList();}
     }catch(e){setStatus(t('create_failed')+e.message);return;}
   }
   if(!S.session)return;
@@ -20682,7 +21962,7 @@ async function promptNewFolder(targetDir = S.currentDir || '.'){
       // System-minted session (#6022): explicit worktree:false — creating a
       // folder from a blank page must not inherit the config worktree default.
       const r=await api('/api/session/new',{method:'POST',body:JSON.stringify({workspace:ws,worktree:false})});
-      if(r&&r.session){S._pendingSessionToolsets=null;S.session=r.session;S.messages=[];syncTopbar();renderMessages();await renderSessionList();}
+      if(r&&r.session){S._pendingSessionToolsets=null;S.session=r.session;if(typeof _adoptRegenerationRevision==='function') _adoptRegenerationRevision(r.session);S.messages=[];syncTopbar();renderMessages();await renderSessionList();}
     }catch(e){setStatus(t('folder_create_failed')+e.message);return;}
   }
   if(!S.session)return;

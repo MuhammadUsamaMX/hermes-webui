@@ -30,6 +30,7 @@ from api.config import (
     coerce_reasoning_effort_for_model,
     gateway_approval_unavailable_reason,
     gateway_supports_approval,
+    peek_stream,
     register_active_run,
     unregister_active_run,
     unregister_stream_owner,
@@ -153,6 +154,9 @@ _WEBUI_GATEWAY_BASE_URL_ENV = "HERMES_WEBUI_GATEWAY_BASE_URL"
 _WEBUI_GATEWAY_API_KEY_ENV = "HERMES_WEBUI_GATEWAY_API_KEY"
 _WEBUI_GATEWAY_USE_RUNS_API_ENV = "HERMES_WEBUI_GATEWAY_USE_RUNS_API"
 _GATEWAY_CHAT_BACKENDS = {"gateway", "api_server", "api-server"}
+# Backend tag of the in-process WebUI runtime. Local workers register their
+# active run with it; cache-only Steer only enqueues on this explicit value.
+WEBUI_LOCAL_CHAT_BACKEND = "legacy"
 
 
 def _gateway_model_field(model: str | None) -> str:
@@ -272,7 +276,7 @@ def webui_chat_backend_mode(config_data=None, environ: dict[str, str] | None = N
     ).strip().lower()
     if raw in _GATEWAY_CHAT_BACKENDS:
         return "gateway"
-    return "legacy"
+    return WEBUI_LOCAL_CHAT_BACKEND
 
 
 def webui_gateway_chat_enabled(config_data=None, environ: dict[str, str] | None = None) -> bool:
@@ -326,6 +330,73 @@ def _gateway_reasoning_effort_for_request(cfg, *, model=None, model_provider=Non
         return None if not coerced else str(coerced)
     except Exception:
         return None
+
+
+def _gateway_session_yolo_enabled(session_id: str) -> bool:
+    """Return the WebUI-owned, in-memory YOLO state for a browser session."""
+    try:
+        from tools.approval import is_session_yolo_enabled
+
+        return bool(is_session_yolo_enabled(str(session_id or "")))
+    except Exception:
+        return False
+
+
+def _settle_gateway_run_approval(
+    session_id: str,
+    approval_data: dict,
+    base_url: str,
+    api_key: str,
+) -> tuple[bool, dict | None, int]:
+    """Auto-approve or mirror one run approval at a session-linearized point."""
+    from api.route_approvals import gateway_yolo_handoff, submit_gateway_pending_mirror
+
+    run_id = str(approval_data.get("run_id") or "").strip()
+    identity_v1 = bool(approval_data.get("_gateway_agent_identity_v1"))
+    with gateway_yolo_handoff(session_id):
+        if _gateway_session_yolo_enabled(session_id):
+            try:
+                _auto_approve_gateway_run(
+                    base_url,
+                    api_key,
+                    run_id,
+                    approval_data["approval_id"] if identity_v1 else "",
+                )
+                return True, None, 0
+            except Exception:
+                # Fail closed: if remote approval fails, surface the real card
+                # before allowing a same-session toggle to pass the handoff.
+                logger.warning(
+                    "WebUI YOLO could not auto-approve run %s; showing approval card",
+                    run_id,
+                    exc_info=True,
+                )
+        head, total = submit_gateway_pending_mirror(session_id, approval_data)
+        return False, head, total
+
+
+def _auto_approve_gateway_run(
+    base_url: str,
+    api_key: str,
+    run_id: str,
+    approval_id: str,
+) -> None:
+    """Resolve one Runs API prompt using only the shipped approval contract.
+
+    This is a WebUI-owned compatibility path: the Runs API does not yet expose
+    session YOLO, so WebUI answers each approval request while its own session
+    flag is enabled. Native Agent-side YOLO would be preferable because it can
+    bypass gates before they pause and also covers Agent-owned computer-use
+    policy; https://github.com/NousResearch/hermes-agent/pull/61946 tracks that
+    API capability. Until then, do not send speculative fields to the Agent.
+    """
+    from api.runner_client import HttpRunnerClient
+
+    HttpRunnerClient(base_url=base_url, api_key=api_key).respond_approval(
+        run_id,
+        approval_id,
+        "once",
+    )
 
 
 def gateway_chat_config_status(config_data=None, environ: dict[str, str] | None = None) -> dict:
@@ -593,7 +664,7 @@ def _run_gateway_runs_api_streaming(
             try:
                 from api.streaming import _build_native_multimodal_message
 
-                message_content = _build_native_multimodal_message("", str(msg_text or ""), attachments, str(workspace), cfg=cfg, active_provider=active_provider, active_model=(model or ""), requested_provider=active_provider)
+                message_content = _build_native_multimodal_message("", str(msg_text or ""), attachments, str(workspace), cfg=cfg, active_provider=active_provider, active_model=(model or ""), requested_provider=active_provider, profile=getattr(session, "profile", None))
             except Exception:
                 logger.debug("Failed to build runs-API multimodal attachment payload", exc_info=True)
                 message_content = str(msg_text or "")
@@ -692,9 +763,17 @@ def _run_gateway_runs_api_streaming(
                 if approval_data:
                     approval_data["run_id"] = run_id
                     from api.config import gateway_supports_approval_identity_v1
-                    approval_data["_gateway_agent_identity_v1"] = bool(approval_data.get("_gateway_raw_approval_id_present")) and gateway_supports_approval_identity_v1(base_url, api_key)
-                    from api.route_approvals import submit_gateway_pending_mirror
-                    head, total = submit_gateway_pending_mirror(session_id, approval_data)
+                    identity_v1 = bool(approval_data.get("_gateway_raw_approval_id_present")) and gateway_supports_approval_identity_v1(base_url, api_key)
+                    approval_data["_gateway_agent_identity_v1"] = identity_v1
+                    auto_approved, head, total = _settle_gateway_run_approval(
+                        session_id,
+                        approval_data,
+                        base_url,
+                        api_key,
+                    )
+                    if auto_approved:
+                        sse_event = "message"
+                        continue
                     put_gateway_event("approval", {**(head or approval_data), "pending_count": total})
                 sse_event = "message"
                 continue
@@ -739,8 +818,12 @@ def _run_gateway_runs_api_streaming(
                 sse_event = "message"
                 continue
             if payload_event == "run.completed":
-                from api.route_approvals import retire_gateway_pending_mirror
-                retire_gateway_pending_mirror(session_id, run_id=run_id)
+                from api.route_approvals import settle_gateway_pending_run
+                settle_gateway_pending_run(
+                    session_id,
+                    run_id,
+                    reason="Gateway run completed before approval resolution",
+                )
                 if payload.get("error"):
                     raise RuntimeError(str(payload["error"]))
                 output = str(payload.get("output") or "")
@@ -752,12 +835,20 @@ def _run_gateway_runs_api_streaming(
                 sse_event = "message"
                 continue
             if payload_event == "run.failed":
-                from api.route_approvals import retire_gateway_pending_mirror
-                retire_gateway_pending_mirror(session_id, run_id=run_id)
+                from api.route_approvals import settle_gateway_pending_run
+                settle_gateway_pending_run(
+                    session_id,
+                    run_id,
+                    reason="Gateway run failed before approval resolution",
+                )
                 raise RuntimeError(str(payload.get("error") or "Gateway run failed"))
             if payload_event == "run.cancelled":
-                from api.route_approvals import retire_gateway_pending_mirror
-                retire_gateway_pending_mirror(session_id, run_id=run_id)
+                from api.route_approvals import settle_gateway_pending_run
+                settle_gateway_pending_run(
+                    session_id,
+                    run_id,
+                    reason="Gateway run was cancelled before approval resolution",
+                )
                 put_gateway_event("cancel", {"message": "Cancelled by gateway"})
                 return None, usage
             reasoning_delta = _gateway_sse_reasoning_delta(payload)
@@ -911,6 +1002,7 @@ def _run_gateway_chat_streaming(
     *,
     model_provider=None,
     goal_related=False,
+    regeneration=False,
 ):
     """Bridge a WebUI chat turn through Hermes Gateway's API server.
 
@@ -920,7 +1012,7 @@ def _run_gateway_chat_streaming(
     the configured Gateway API server into those local events and persists the
     final user/assistant turn back into the WebUI session.
     """
-    q = STREAMS.get(stream_id)
+    q = peek_stream(stream_id)
     if q is None:
         _finish_gateway_run_starting(stream_id, result="fallback")
         _clear_gateway_run_starting(stream_id)
@@ -978,7 +1070,7 @@ def _run_gateway_chat_streaming(
             except Exception:
                 logger.debug("Failed to note gateway event_id %s for stream %s", event_id, stream_id, exc_info=True)
         try:
-            queue_item = (event, data, event_id) if event_id and hasattr(q, "subscribe_with_snapshot") else (event, data)
+            queue_item = (event, data, event_id) if hasattr(q, "subscribe_with_snapshot") else (event, data)
             q.put_nowait(queue_item)
         except Exception:
             logger.debug("Failed to put gateway event to queue")
@@ -1120,7 +1212,7 @@ def _run_gateway_chat_streaming(
                 try:
                     from api.streaming import _build_native_multimodal_message
 
-                    message_content = _build_native_multimodal_message("", str(msg_text or ""), attachments, str(workspace), cfg=cfg, active_provider=(model_provider or ""), active_model=(model or ""), requested_provider=(model_provider or ""))
+                    message_content = _build_native_multimodal_message("", str(msg_text or ""), attachments, str(workspace), cfg=cfg, active_provider=(model_provider or ""), active_model=(model or ""), requested_provider=(model_provider or ""), profile=getattr(s, "profile", None))
                 except Exception:
                     logger.debug("Failed to build gateway multimodal attachment payload", exc_info=True)
                     message_content = str(msg_text or "")
@@ -1298,18 +1390,29 @@ def _run_gateway_chat_streaming(
             # same sort key; later transcript merges can then fall back to
             # role/content ordering instead of turn order.
             assistant_ts = now + 0.000001
-            user_msg = {"role": "user", "content": str(msg_text or ""), "timestamp": now}
             pending_source = getattr(s, "pending_user_source", None) or "webui"
-            if pending_source != "webui":
-                user_msg["_source"] = pending_source
-            if attachments:
-                user_msg["attachments"] = list(attachments)
+            from api.streaming import _active_turn_authority, _materialize_active_turn_user
+
+            active_turn_identity = _active_turn_authority(s, stream_id, msg_text)
+            user_msg = _materialize_active_turn_user(
+                active_turn_identity,
+                str(msg_text or ""),
+                pending_source,
+            )
+            user_msg["timestamp"] = float(
+                active_turn_identity.get("timestamp") or now
+            )
             assistant_msg = {"role": "assistant", "content": assistant_text, "timestamp": assistant_ts}
             saved_reasoning = STREAM_REASONING_TEXT.get(stream_id, "")
             if saved_reasoning:
                 assistant_msg["reasoning"] = saved_reasoning
             previous_messages = list(getattr(s, "messages", None) or [])
-            previous_context = list(getattr(s, "context_messages", None) or getattr(s, "messages", None) or [])
+            stored_context = getattr(s, "context_messages", None)
+            previous_context = list(
+                stored_context
+                if isinstance(stored_context, list) and (regeneration or stored_context)
+                else getattr(s, "messages", None) or []
+            )
             previous_process_wakeup_pause = dict(getattr(s, "process_wakeup_pause", {}) or {})
             # Stamp stable ids on the two new rows (shared with the display merge
             # below) so display and model-context copies share an id for the
@@ -1596,10 +1699,14 @@ def _run_gateway_chat_streaming(
         mapped_run_id = str(_STREAM_RUN_IDS.get(stream_id) or "").strip()
         if mapped_run_id:
             try:
-                from api.route_approvals import retire_gateway_pending_mirror
-                retire_gateway_pending_mirror(session_id, run_id=mapped_run_id)
+                from api.route_approvals import settle_gateway_pending_run
+                settle_gateway_pending_run(
+                    session_id,
+                    mapped_run_id,
+                    reason="Gateway run ended during teardown before approval resolution",
+                )
             except Exception:
-                logger.debug("Failed to retire gateway pending mirrors during teardown", exc_info=True)
+                logger.debug("Failed to settle gateway pending approvals during teardown", exc_info=True)
         if s is not None:
             try:
                 with _get_session_agent_lock(session_id):

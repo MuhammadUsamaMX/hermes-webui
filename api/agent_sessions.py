@@ -6,6 +6,17 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# state.db paths that already produced the "no 'source' column" warning below.
+# ``get_cli_sessions(all_profiles=True)`` re-reads every profile DB on every
+# sidebar poll (behind a 5 s cache), so a single pre-``source`` profile DB would
+# otherwise re-emit the identical WARNING line every ~15 s for the life of the
+# process. The condition is a property of the DB file, not of the poll, so it
+# is reported once per path. Process-lifetime only: a restart warns again,
+# which is the desired behaviour (the log line is the operator's cue that the
+# agent still needs upgrading). Plain ``set`` mutation under the GIL is
+# sufficient here; a duplicate line from two racing first calls is harmless.
+_SOURCE_COLUMN_WARNED_DB_PATHS: set[str] = set()
+
 
 def open_state_db_readonly(db_path: Path, log: logging.Logger | None = None) -> sqlite3.Connection:
     """Open the live agent ``state.db`` read-only for a pure-read projection.
@@ -48,6 +59,7 @@ MESSAGING_SOURCES = {
     'telegram',
     'weixin',
     'matrix',
+    'signal',
 }
 
 CLI_MIN_UNTITLED_MESSAGE_COUNT = 6
@@ -71,6 +83,7 @@ SOURCE_LABELS = {
     'webui': 'WebUI',
     'weixin': 'Weixin',
     'matrix': 'Matrix',
+    'signal': 'Signal',
 }
 
 
@@ -517,6 +530,19 @@ def read_importable_agent_session_rows(
     ``exclude_sources=None``. ``include_sources`` is an additional narrowing
     filter; callers that want an include-only query should explicitly pass
     ``exclude_sources=None`` so the default exclusions do not also apply.
+
+    ``limit`` bounds the *recency slice*, not the returned row count. Subagent
+    rows only render as children when their parent row is in the same payload,
+    so subagent ancestors of selected rows are re-added afterwards and the
+    result can exceed ``limit`` by the number of such anchors. Callers must
+    therefore iterate the result rather than assume ``len(rows) <= limit``.
+
+    That recovery is deliberately bounded by the oversampled candidate set
+    (``limit * 8`` newest sessions): it re-uses rows the projection already
+    fetched and never issues an extra query, so an ancestor older than the
+    oversample stays unresolved and its children render top-level, exactly as
+    they did before. Widening that window is a ``candidate_limit`` change, not
+    a change to this walk.
     """
     db_path = Path(db_path)
     if not db_path.exists():
@@ -549,12 +575,15 @@ def read_importable_agent_session_rows(
         cur.execute("PRAGMA table_info(messages)")
         message_cols = {row[1] for row in cur.fetchall()}
         if 'source' not in session_cols:
-            log.warning(
-                "agent session listing skipped: state.db at %s has no 'source' column "
-                "(older hermes-agent?). Agent sessions unavailable. "
-                "Upgrade hermes-agent to fix this.",
-                db_path,
-            )
+            warned_key = str(db_path.resolve())
+            if warned_key not in _SOURCE_COLUMN_WARNED_DB_PATHS:
+                _SOURCE_COLUMN_WARNED_DB_PATHS.add(warned_key)
+                log.warning(
+                    "agent session listing skipped: state.db at %s has no 'source' column "
+                    "(older hermes-agent?). Agent sessions unavailable. "
+                    "Upgrade hermes-agent to fix this.",
+                    db_path,
+                )
             return []
 
         parent_expr = _optional_col('parent_session_id', session_cols)
@@ -766,7 +795,43 @@ def read_importable_agent_session_rows(
         projected = [row for row in projected if is_cli_session_row_visible(row)]
         if limit is None:
             return projected
-        return projected[:max(0, int(limit))]
+        selected = projected[:max(0, int(limit))]
+
+        # The recency slice is per-row, but subagent rows are only renderable as
+        # children: the sidebar nests a child under its parent solely when that
+        # parent row is present in the same payload. A frozen orchestrator stops
+        # writing while its leaves keep streaming, so the leaves win the recency
+        # race and the parent falls outside the window — leaving the leaves to be
+        # promoted to top-level sidebar rows. Re-add subagent parents that the
+        # oversampled candidate set already projected (no extra query); webui
+        # ancestors are left out because that sidebar bucket already has them.
+        #
+        # Bounded by construction: ``by_id`` only holds the ``limit * 8``
+        # newest candidates, so an ancestor older than that oversample is not
+        # recovered and its children stay top-level — the pre-existing
+        # behaviour, narrowed rather than fixed. Resolving those would need an
+        # unbounded per-row ancestor query on the hot sidebar path; widen
+        # ``candidate_limit`` instead if the window proves too tight.
+        # NOTE: this can return more than ``limit`` rows (see docstring).
+        have = {row.get('id') for row in selected}
+        by_id = {row.get('id'): row for row in projected if row.get('id')}
+        pending = list(selected)
+        while pending:
+            row = pending.pop()
+            if str(row.get('raw_source') or row.get('source') or '').strip().lower() != 'subagent':
+                continue
+            parent_id = row.get('parent_session_id')
+            if not parent_id or parent_id in have:
+                continue
+            parent = by_id.get(parent_id)
+            if parent is None:
+                continue
+            if str(parent.get('raw_source') or parent.get('source') or '').strip().lower() != 'subagent':
+                continue
+            selected.append(parent)
+            have.add(parent_id)
+            pending.append(parent)
+        return selected
 
 
 

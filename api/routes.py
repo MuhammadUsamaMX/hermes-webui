@@ -5248,8 +5248,10 @@ def _get_or_materialize_session(sid: str, *, refresh_cli_messages: bool = False)
     except KeyError:
         pass
 
-    # Fallback: try to materialize from CLI/agent session metadata
-    cli_meta = _lookup_cli_session_metadata(sid)
+    # Fallback: try to materialize from CLI/agent session metadata.
+    # #7549: try active profile first, then all profiles when the all-profiles
+    # sidebar view is enabled — matches the archive handler pattern.
+    cli_meta = _resolve_cli_import_metadata(sid, allow_all_profiles=True)
 
     # Delegated subagent children (#5307) are view-only: their transcript lives
     # in state.db and ownership belongs to the delegate runner, not WebUI. They
@@ -5293,7 +5295,7 @@ def _get_or_materialize_session(sid: str, *, refresh_cli_messages: bool = False)
         # Messaging sessions: lightweight Session with no messages (state.db is source of truth)
         s = Session(
             session_id=sid,
-            title=cli_meta.get("title") or title_from(get_cli_session_messages(sid), "CLI Session"),
+            title=cli_meta.get("title") or title_from(get_cli_session_messages(sid, profile=cli_meta.get("profile")), "CLI Session"),
             workspace=get_last_workspace(),
             model=cli_meta.get("model") or "unknown",
             created_at=cli_meta.get("created_at"),
@@ -5303,7 +5305,7 @@ def _get_or_materialize_session(sid: str, *, refresh_cli_messages: bool = False)
         s.save(touch_updated_at=False)
     else:
         # Regular CLI/agent sessions: import full message history
-        msgs = get_cli_session_messages(sid)
+        msgs = get_cli_session_messages(sid, profile=cli_meta.get("profile"))
         if not msgs:
             raise KeyError(sid)
         s = import_cli_session(
@@ -17030,7 +17032,10 @@ def handle_post(handler, parsed) -> bool:
                 with LOCK:
                     SESSIONS[sid] = s
         except KeyError:
-            cli_meta = _lookup_cli_session_metadata(sid)
+            # #7549: look up across all profiles when the all-profiles sidebar
+            # view is enabled — a session that belongs to a non-active profile
+            # is legitimately visible and archivable from the merged sidebar.
+            cli_meta = _resolve_cli_import_metadata(sid, allow_all_profiles=True)
             if not cli_meta:
                 return bad(handler, "Session not found", 404)
             if cli_meta.get("read_only"):
@@ -17045,10 +17050,11 @@ def handle_post(handler, parsed) -> bool:
             if _is_messaging_session_record(cli_meta):
                 s = Session(
                     session_id=sid,
-                    title=cli_meta.get("title") or title_from(get_cli_session_messages(sid), "CLI Session"),
+                    title=cli_meta.get("title") or title_from(get_cli_session_messages(sid, profile=cli_meta.get("profile")), "CLI Session"),
                     workspace=get_last_workspace(),
                     messages=[],
                     model=cli_meta.get("model") or "unknown",
+                    profile=cli_meta.get("profile"),
                     created_at=cli_meta.get("created_at"),
                     updated_at=cli_meta.get("updated_at"),
                 )
@@ -17065,7 +17071,7 @@ def handle_post(handler, parsed) -> bool:
                 s.platform = cli_meta.get("platform")
                 s.save(touch_updated_at=False)
             else:
-                msgs = get_cli_session_messages(sid)
+                msgs = get_cli_session_messages(sid, profile=cli_meta.get("profile"))
                 if not msgs:
                     return bad(handler, "Session not found", 404)
                 s = import_cli_session(

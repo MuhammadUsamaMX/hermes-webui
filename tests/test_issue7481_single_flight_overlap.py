@@ -21,7 +21,6 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO.parent / ".hermes" / "hermes-agent"))
 
 import api.config as config
-from api.config import CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS
 
 
 @pytest.fixture(autouse=True)
@@ -211,3 +210,136 @@ class TestOriginalStarvationFix:
         assert "named-live-model" in model_ids, (
             f"named-live-model must appear in foreground response, got {model_ids}"
         )
+
+
+class _KeyedResponse:
+    """Minimal context-manager response body for a single /v1/models probe."""
+
+    def __init__(self, model_id: str):
+        self._model_id = model_id
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self) -> bytes:
+        return json.dumps({"data": [{"id": self._model_id}]}).encode("utf-8")
+
+
+class TestRegateDeferralCredentials:
+    """#7481 re-gate: the single-flight deferral must compare more than the URL."""
+
+    def test_same_url_providers_with_different_keys_keep_their_own_live_models(
+        self, tmp_path, monkeypatch
+    ):
+        """Two named providers sharing the active base_url but using DIFFERENT
+        API keys must both come back populated, each from a probe made with its
+        own key.  Deferring on the URL alone filed the active result under a
+        single provider key and starved (or 401'd) the other one."""
+        requests: list[tuple[str, str]] = []  # (url, authorization header)
+
+        def fake_urlopen(req, timeout=None):
+            auth = req.get_header("Authorization") or ""
+            requests.append((req.full_url, auth))
+            if auth == "Bearer key-b":
+                return _KeyedResponse("team-b-live")
+            if auth == "Bearer key-a":
+                return _KeyedResponse("team-a-live")
+            return _KeyedResponse("wrong-credentials-model")
+
+        _setup_config(
+            tmp_path,
+            (
+                "model:\n"
+                "  provider: custom:team-a\n"
+                "  base_url: http://localhost:8080/v1\n"
+                "  api_key: key-a\n"
+                "custom_providers:\n"
+                "  - name: team-a\n"
+                "    base_url: http://localhost:8080/v1\n"
+                "    api_key: key-a\n"
+                "  - name: team-b\n"
+                "    base_url: http://localhost:8080/v1\n"
+                "    api_key: key-b\n"
+            ),
+            monkeypatch,
+        )
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+        result = config.get_available_models()
+
+        groups = result.get("groups", [])
+        team_a = next((g for g in groups if g.get("provider_id") == "custom:team-a"), None)
+        team_b = next((g for g in groups if g.get("provider_id") == "custom:team-b"), None)
+        assert team_a is not None, "custom:team-a group must exist"
+        assert team_b is not None, "custom:team-b group must exist"
+
+        a_ids = [m["id"].removeprefix("@custom:team-a:") for m in team_a.get("models", [])]
+        b_ids = [m["id"].removeprefix("@custom:team-b:") for m in team_b.get("models", [])]
+        assert "team-a-live" in a_ids, (
+            f"team-a must keep its own live models (probed with key-a), got {a_ids}"
+        )
+        assert "team-b-live" in b_ids, (
+            f"team-b must keep its own live models (probed with key-b), got {b_ids}"
+        )
+        assert "wrong-credentials-model" not in a_ids + b_ids, (
+            "no group may carry models fetched with someone else's credentials"
+        )
+
+        # Every probe carried a real key: one with key-a, one with key-b.
+        auths = [auth for _url, auth in requests]
+        assert auths.count("Bearer key-a") == 1, (
+            f"team-a must be probed exactly once with key-a, got {requests}"
+        )
+        assert auths.count("Bearer key-b") == 1, (
+            f"team-b must be probed exactly once with key-b, got {requests}"
+        )
+        assert len(requests) == 2, f"expected one probe per credential, got {requests}"
+
+    def test_named_group_with_configured_model_merges_live_models(self, tmp_path, monkeypatch):
+        """A named group that already carries a configured singular ``model``
+        entry must still absorb the live /v1/models result — master returns the
+        live model plus the configured entry, not the configured entry alone."""
+        requests: list[str] = []
+
+        def fake_urlopen(req, timeout=None):
+            requests.append(req.full_url)
+            return _KeyedResponse("live-from-endpoint")
+
+        _setup_config(
+            tmp_path,
+            (
+                "model:\n"
+                "  provider: custom:single-model\n"
+                "  base_url: http://localhost:11434/v1\n"
+                "  api_key: local-key\n"
+                "custom_providers:\n"
+                "  - name: single-model\n"
+                "    base_url: http://localhost:11434/v1\n"
+                "    api_key: local-key\n"
+                "    model: configured-single-model\n"
+            ),
+            monkeypatch,
+        )
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+        result = config.get_available_models()
+
+        groups = result.get("groups", [])
+        named_group = next(
+            (g for g in groups if g.get("provider_id") == "custom:single-model"), None
+        )
+        assert named_group is not None, "custom:single-model group must exist"
+        model_ids = [m["id"] for m in named_group.get("models", [])]
+
+        assert "configured-single-model" in model_ids, (
+            f"configured model entry must survive, got {model_ids}"
+        )
+        assert "live-from-endpoint" in model_ids, (
+            f"live model must merge into the configured group, got {model_ids}"
+        )
+        assert len(model_ids) == len(set(model_ids)), f"deduplicate by id, got {model_ids}"
+        # Single-flight still holds: the configured entry must not add a probe.
+        assert len(requests) == 1, f"expected exactly 1 probe, got {requests}"

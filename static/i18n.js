@@ -372,6 +372,7 @@ const LOCALES = {
     reasoning_effort_medium: 'Medium',
     reasoning_effort_high: 'High',
     reasoning_effort_xhigh: 'Extra High',
+    reasoning_effort_xhigh_short: 'XHigh',
     reasoning_effort_max: 'Max',
     reasoning_effort_aria_label: 'Reasoning effort: {0}',
 
@@ -2273,6 +2274,7 @@ const LOCALES = {
     reasoning_effort_medium: 'Medium',
     reasoning_effort_high: 'High',
     reasoning_effort_xhigh: 'Extra High',
+    reasoning_effort_xhigh_short: 'XHigh',
     reasoning_effort_max: 'Max',
     reasoning_effort_aria_label: 'Reasoning effort: {0}',
 
@@ -4112,6 +4114,7 @@ const LOCALES = {
     reasoning_effort_medium: 'Medium',
     reasoning_effort_high: 'High',
     reasoning_effort_xhigh: 'Extra High',
+    reasoning_effort_xhigh_short: 'XHigh',
     reasoning_effort_max: 'Max',
     reasoning_effort_aria_label: 'Reasoning effort: {0}',
 
@@ -5897,6 +5900,7 @@ const LOCALES = {
     reasoning_effort_medium: 'Medium',
     reasoning_effort_high: 'High',
     reasoning_effort_xhigh: 'Extra High',
+    reasoning_effort_xhigh_short: 'XHigh',
     reasoning_effort_max: 'Max',
     reasoning_effort_aria_label: 'Reasoning effort: {0}',
 
@@ -7762,6 +7766,7 @@ const LOCALES = {
     reasoning_effort_medium: 'Medium',
     reasoning_effort_high: 'High',
     reasoning_effort_xhigh: 'Extra High',
+    reasoning_effort_xhigh_short: 'XHigh',
     reasoning_effort_max: 'Max',
     reasoning_effort_aria_label: 'Reasoning effort: {0}',
 
@@ -9516,6 +9521,7 @@ const LOCALES = {
     reasoning_effort_medium: 'Medium',
     reasoning_effort_high: 'High',
     reasoning_effort_xhigh: 'Extra High',
+    reasoning_effort_xhigh_short: 'XHigh',
     reasoning_effort_max: 'Max',
     reasoning_effort_aria_label: 'Reasoning effort: {0}',
 
@@ -11325,6 +11331,7 @@ const LOCALES = {
     reasoning_effort_medium: 'Medium',
     reasoning_effort_high: 'High',
     reasoning_effort_xhigh: 'Extra High',
+    reasoning_effort_xhigh_short: 'XHigh',
     reasoning_effort_max: 'Max',
     reasoning_effort_aria_label: 'Reasoning effort: {0}',
 
@@ -13111,6 +13118,7 @@ const LOCALES = {
     reasoning_effort_medium: 'Medium',
     reasoning_effort_high: 'High',
     reasoning_effort_xhigh: 'Extra High',
+    reasoning_effort_xhigh_short: 'XHigh',
     reasoning_effort_max: 'Max',
     reasoning_effort_aria_label: 'Reasoning effort: {0}',
 
@@ -14876,6 +14884,7 @@ const LOCALES = {
     reasoning_effort_medium: 'Medium',
     reasoning_effort_high: 'High',
     reasoning_effort_xhigh: 'Extra High',
+    reasoning_effort_xhigh_short: 'XHigh',
     reasoning_effort_max: 'Max',
     reasoning_effort_aria_label: 'Reasoning effort: {0}',
 
@@ -16597,6 +16606,7 @@ const LOCALES = {
     reasoning_effort_medium: 'Medium',
     reasoning_effort_high: 'High',
     reasoning_effort_xhigh: 'Extra High',
+    reasoning_effort_xhigh_short: 'XHigh',
     reasoning_effort_max: 'Max',
     reasoning_effort_aria_label: 'Reasoning effort: {0}',
 
@@ -18430,6 +18440,7 @@ const LOCALES = {
     reasoning_effort_medium: 'Medium',
     reasoning_effort_high: 'High',
     reasoning_effort_xhigh: 'Extra High',
+    reasoning_effort_xhigh_short: 'XHigh',
     reasoning_effort_max: 'Max',
     reasoning_effort_aria_label: 'Reasoning effort: {0}',
 
@@ -21204,6 +21215,7 @@ const LOCALES = {
     reasoning_effort_medium: 'Medium',
     reasoning_effort_high: 'High',
     reasoning_effort_xhigh: 'Extra High',
+    reasoning_effort_xhigh_short: 'XHigh',
     reasoning_effort_max: 'Max',
     reasoning_effort_aria_label: 'Reasoning effort: {0}',
 
@@ -22057,6 +22069,7 @@ const LOCALES = {
     reasoning_effort_medium: 'Medium',
     reasoning_effort_high: 'High',
     reasoning_effort_xhigh: 'Extra High',
+    reasoning_effort_xhigh_short: 'XHigh',
     reasoning_effort_max: 'Max',
     reasoning_effort_aria_label: 'Reasoning effort: {0}',
 
@@ -23882,6 +23895,7 @@ const LOCALES = {
     reasoning_effort_medium: 'Medium',
     reasoning_effort_high: 'High',
     reasoning_effort_xhigh: 'Extra High',
+    reasoning_effort_xhigh_short: 'XHigh',
     reasoning_effort_max: 'Max',
     reasoning_effort_aria_label: 'Reasoning effort: {0}',
 
@@ -25692,6 +25706,7 @@ const LOCALES = {
     reasoning_effort_medium: 'Medium',
     reasoning_effort_high: 'High',
     reasoning_effort_xhigh: 'Extra High',
+    reasoning_effort_xhigh_short: 'XHigh',
     reasoning_effort_max: 'Max',
     reasoning_effort_aria_label: 'Reasoning effort: {0}',
 

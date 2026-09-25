@@ -55,7 +55,8 @@ snapshot must not silently drop a visible transcript. The `done` path had no suc
 guard.
 
 Two rules fix it, both in `static/messages.js::_adoptDoneSnapshotMessages`, which the
-`done` listener now routes through instead of adopting `d.session.messages` blind:
+`done` listener now runs as a settle guard immediately after the existing #3018
+carry-forward assignment and before `_filterRecoveryControlMessages`:
 
 1. only a snapshot that actually carries messages may REPLACE a populated transcript —
    an empty/absent one has nothing to reconcile;
@@ -140,19 +141,27 @@ def _visible_texts(messages) -> list[str]:
 # RED: the adoption guard must exist and be wired into the done listener.
 # --------------------------------------------------------------------------- #
 def test_done_settle_has_snapshot_adoption_guard():
-    """The `done` listener must not inline the bare carry-forward.
+    """The `done` listener must run the settle guard over the adopted transcript.
 
-    A settle event has to go through `_adoptDoneSnapshotMessages`, otherwise an
-    empty/absent `session.messages` wipes the visible transcript (#6112).
+    The guard has to fire AFTER the #3018 carry-forward assignment (which is where an
+    empty/absent `session.messages` blanks the visible transcript) and BEFORE
+    `_filterRecoveryControlMessages` and the settled `renderMessages()` rebuild
+    (#6112).
     """
     done = _done_listener_src()
-    assert "_adoptDoneSnapshotMessages(" in done, (
-        "the done listener must adopt the settled snapshot through "
-        "_adoptDoneSnapshotMessages so an empty payload cannot blank the transcript"
+    carry_idx = done.find("S.messages=_carryForwardEphemeralTurnFields(S.messages||[], d.session.messages||[])")
+    guard_idx = done.find("S.messages=_adoptDoneSnapshotMessages(")
+    filter_idx = done.find("S.messages=_filterRecoveryControlMessages")
+    assert carry_idx != -1, "the done listener must still do the #3018 carry-forward"
+    assert guard_idx != -1, (
+        "the done listener must run _adoptDoneSnapshotMessages so an empty payload "
+        "cannot blank the transcript, and a payload without the streamed answer cannot "
+        "drop it (#6112)"
     )
-    assert "S.messages=_carryForwardEphemeralTurnFields(S.messages||[], d.session.messages||[])" not in done, (
-        "the done listener still adopts d.session.messages unconditionally, which "
-        "replaces the whole transcript with [] when the payload has no messages (#6112)"
+    assert filter_idx != -1, "the done listener must still filter recovery controls"
+    assert carry_idx < guard_idx < filter_idx, (
+        "the settle guard must run after the carry-forward and before the recovery "
+        "filter / settled render"
     )
 
 
@@ -166,7 +175,9 @@ def _run(prev_messages: str, done_session: str, final_answer: str | None = None)
         const prevMessages = {prev_messages};
         const doneSession = {done_session};
         const finalAnswer = {answer_js};
-        const out = _adoptDoneSnapshotMessages(prevMessages, doneSession, finalAnswer);
+        const rawMessages = (doneSession && Array.isArray(doneSession.messages)) ? doneSession.messages : [];
+        const settledMessages = _carryForwardEphemeralTurnFields(prevMessages, rawMessages);
+        const out = _adoptDoneSnapshotMessages(prevMessages, settledMessages, finalAnswer);
         const msgs = Array.isArray(out.messages) ? out.messages : [];
         console.log(JSON.stringify({{
             adopted: !!out.adopted,

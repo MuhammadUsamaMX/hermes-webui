@@ -9159,7 +9159,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 return "", ""
             base = cfg_base_url.strip()
             configured_provider = _configured_provider_for_base_url(base)
-            resolved_provider = configured_provider or "custom"
+            provider = configured_provider or "custom"
             provider_from_config = bool(configured_provider)
             parsed = urlparse(base if "://" in base else f"http://{base}")
             host = (parsed.netloc or parsed.path).lower()
@@ -9171,9 +9171,9 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     addr = ipaddress.ip_address(parsed.hostname)
                     if addr.is_private or addr.is_loopback or addr.is_link_local:
                         if "ollama" in host or "127.0.0.1" in host or "localhost" in host:
-                            resolved_provider = "ollama"
+                            provider = "ollama"
                         elif "lmstudio" in host or "lm-studio" in host:
-                            resolved_provider = "lmstudio"
+                            provider = "lmstudio"
                         else:
                             # Unknown loopback/private endpoint: route through
                             # the generic ``custom`` provider so the agent's
@@ -9184,7 +9184,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                             # compression mid-conversation because ``local``
                             # is not a registered provider in
                             # ``hermes_cli.auth.PROVIDER_REGISTRY`` — see #1384.
-                            resolved_provider = "custom"
+                            provider = "custom"
                 except ValueError:
                     pass
 
@@ -9212,7 +9212,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     key = (all_env.get(env_key) or _thread_local_env_value(env_key) or "").strip()
                     if key:
                         break
-            return resolved_provider, key
+            return provider, key
 
         def _models_endpoint_for_base_url(base_url: str) -> str:
             base = str(base_url or "").strip().rstrip("/")

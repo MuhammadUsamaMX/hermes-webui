@@ -77,7 +77,7 @@ and 5; it does not mark every run-state boundary implemented.
 | Compression summary / handoff | Gives the agent recovery context after automatic compression | Must remain agent-facing recovery material unless explicitly rendered as history | Pollute the active turn or become implicit current user intent |
 | Live UI scene/cache | Preserves expanded rows, in-progress cards, local scroll, and transient grouping | May optimize presentation but must be rebuildable or degradable from transcript/replay | Become the only place where chronological ordering exists |
 | Sidebar/session metadata | Helps the user find active and recent sessions | Must reflect meaningful user or assistant activity | Treat background cleanup as a fresh user-facing update |
-| Derived model/context metadata | Projects model catalog and context-window limits into pickers, context bars, and compression thresholds | Must re-sync from its source config or `/api/models` before it is rendered or acted on | Outlive its source (stale TTL cache, stale limit after resume or model switch) and drive thresholds silently |
+| Derived model/context metadata | Projects the model catalog, plus context-window and threshold limits, into pickers, context bars, and compression thresholds | Must re-sync from its own source — config/`/api/models` for the catalog, session/stream usage for window and threshold — before it is rendered or acted on | Outlive its source (stale TTL cache, stale usage after resume or model switch) and drive thresholds silently |
 
 ### Authority matrix
 
@@ -89,7 +89,7 @@ shifts (#5513, #5542).
 
 | Layer | Authority | Persistence lifetime | Allowed divergence | Replay / recovery rule |
 |---|---|---|---|---|
-| Visible transcript | Settled sidecar session file (`SESSION_DIR`, `Session.messages`); while a turn runs, the streamed scene feeding it | Durable on disk until the session is deleted; `.json.bak` retained for recovery | May trail the live stream by in-flight events; may downgrade to labeled structured replay, never to silently reordered rows | Rebuild chronologically from sidecar rows plus run journal events; never from the browser cache |
+| Visible transcript | Settled sidecar session file (`SESSION_DIR`, `Session.messages`); while a turn runs, the streamed scene feeding it | Durable on disk until the session is deleted; `.json.bak` retained for recovery | May trail the live stream by in-flight events; may downgrade to labeled structured replay, never to silently reordered rows | Rebuild chronologically from sidecar rows plus run journal events, letting `recover_session()` restore a larger `.json.bak` first; never from the browser cache |
 | Model context (`context_messages`) | Server-side reconstruction over `Session.context_messages` at handoff time | Rebuilt per turn; persisted only as far as the sidecar persists it | May differ from the visible transcript only for deliberately excluded turns, with the reason shown to the user | Recovery must re-include the visible or pending user turn (invariant 1) before any continuation is requested |
 | Pending turn metadata | `pending_user_message` with `pending_started_at` / `pending_user_source` on the session record | From submit until the turn is checkpointed into `Session.messages` and the field is cleared | Metadata only; must never become a second transcript row | Turn journal (`TURN_JOURNAL_DIR_NAME`) re-derives state; `_latest_user_matches_pending_text` decides whether a recovered pending turn is already checkpointed |
 | Live stream / SSE | Observation path only: `STREAMS` channels and the session events routes | Process memory, per stream; gone on restart | May lose events on disconnect; anything already emitted must remain recoverable elsewhere | Replay from `RUN_JOURNAL_DIR_NAME` with a cursor; live and replayed events share one renderer |
@@ -98,7 +98,7 @@ shifts (#5513, #5542).
 | Compression summary / handoff | `compression_anchor_*` session fields produced by `is_context_compression_marker()` | Retained as anchor/recovery metadata; live-only divider rows are omitted from settled history | Agent-facing recovery material may exist with no matching user-visible row | Render as a quiet non-interactive divider only; later tool, reasoning, or interim events prove the barrier passed |
 | Live UI scene/cache | None — presentation only: `INFLIGHT`, `INFLIGHT_STATE_*`, renderer caches, DOM | Tab-local; localStorage snapshots are best-effort and cleared on teardown | May be stale, degraded, or partially rebuilt | Rebuildable from transcript plus replay; if it cannot be, downgrade to explicit structured replay (invariant 3) |
 | Sidebar/session metadata | Projection: `SESSION_INDEX_FILE` (`_index.json`) and the session list cache; counts come from the session store | Durable but derived; pruned and rebuilt by recovery (`_rebuild_recovery_session_index`) | May lag counts briefly; must never be refreshed by maintenance as if it were activity (invariant 4) | Rebuilt after recovery or repair so restored rows appear immediately |
-| Derived model/context metadata | Source config (`config.yaml`, `_PROVIDER_MODELS`) and the `/api/models` response | Cache only: `STATE_DIR/models_cache.json` via `_get_models_cache_path`, plus in-memory `_available_models_cache` / `_available_models_cache_ts` TTL | May lag its source only within the TTL, and must be invalidated when the source changes (#2443) | After a session resume or model switch, the UI re-syncs from the server before rendering context windows or compression thresholds (#2442) |
+| Derived model/context metadata | Two sources: the model catalog — source config (`config.yaml`, `_PROVIDER_MODELS`) and the `/api/models` response — and the window/threshold values the indicator reads from session and stream usage (`context_length`, `threshold_tokens`) | Catalog cache only: `STATE_DIR/models_cache.json` via `_get_models_cache_path`, plus in-memory `_available_models_cache` / `_available_models_cache_ts` TTL; usage values live with the session/stream payload and persist only as far as the session store does | Catalog may lag its source only within the TTL and must be invalidated when the source changes (#2443); usage may lag until the next payload, never across a resume or model switch | Catalog: re-read from `/api/models` after a source change. Usage: re-sync from the session/stream payload after a resume or model switch, before the UI renders context windows or compression thresholds (#2442) |
 
 ## Core Invariants
 
@@ -183,10 +183,11 @@ shifts (#5513, #5542).
     disagree, the source wins, and a change at the source must invalidate or
     re-sync every downstream projection before it is rendered or acted on: a
     model catalog cache must not outlive a provider config change (#2443),
-    context-window metadata must be re-synced after a session resume or model
-    switch before the UI computes compression thresholds (#2442), and a stale
-    client-side busy or optimistic flag must never block a new turn or override
-    canonical idle server rows (#2796).
+    context-window metadata — the session/stream usage `context_length` and
+    `threshold_tokens` the indicator reads — must be re-synced after a session
+    resume or model switch before the UI computes compression thresholds
+    (#2442), and a stale client-side busy or optimistic flag must never block a
+    new turn or override canonical idle server rows (#2796).
 11. **Recovery leaves provenance, not only content.** Startup or repair that
     restores state from a backup or `state.db` (`recover_session()`,
     `recover_missing_sidecars_from_state_db()`) must also persist content-free

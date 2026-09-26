@@ -65,10 +65,29 @@ def test_rfc_has_an_authority_matrix_with_the_four_required_axes():
         assert column in header, f"authority matrix must have a {column!r} column"
 
 
-def test_rfc_authority_matrix_covers_every_state_layer():
-    text = _rfc()
-    matrix = _section(text, "## State Layers")
+def _authority_matrix_rows(text: str) -> list[list[str]]:
+    """Body rows of the '### Authority matrix' table (header and separator
+    excluded), each as its list of cells."""
+    matrix = _section(text, "### Authority matrix")
+    rows = []
+    for line in matrix.splitlines():
+        if not line.startswith("|"):
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if not cells or cells[0] == "Layer" or set(cells[0]) <= {"-"}:
+            continue
+        rows.append(cells)
+    return rows
 
+
+def test_rfc_authority_matrix_covers_every_state_layer():
+    """Coverage is checked against the matrix rows themselves — the purpose
+    table above it repeats the same layer names, so checking the whole section
+    would let a layer silently disappear from the matrix."""
+    rows = _authority_matrix_rows(_rfc())
+    assert rows, "authority matrix must have body rows"
+
+    layer_names = [row[0] for row in rows]
     layers = [
         "Visible transcript",
         "Model context",
@@ -81,33 +100,70 @@ def test_rfc_authority_matrix_covers_every_state_layer():
         "Sidebar/session metadata",
         "Derived model/context metadata",
     ]
-    missing = [layer for layer in layers if layer not in matrix]
+    missing = [
+        layer
+        for layer in layers
+        if not any(name.startswith(layer) for name in layer_names)
+    ]
     assert missing == [], f"authority matrix must cover layers: {missing}"
 
+    for row in rows:
+        assert len(row) == 5, f"matrix row must have 5 cells: {row!r}"
+        empty = [index for index, cell in enumerate(row) if not cell]
+        assert empty == [], f"matrix row has empty cells {empty}: {row!r}"
 
-# (file, symbol) pairs the RFC cites as stable source anchors. Symbol names
-# only — line numbers rot on any source-layout shift (#5513, #5542).
+
+def test_rfc_derived_metadata_row_names_both_sources():
+    """The derived layer projects two different things from two different
+    sources: the model catalog (config -> /api/models -> cache) and the
+    context window/threshold values that come from session/stream usage. A
+    row that names only one invites reviewers to check one and miss the other."""
+    derived = next(
+        (
+            row
+            for row in _authority_matrix_rows(_rfc())
+            if row[0].startswith("Derived model/context metadata")
+        ),
+        None,
+    )
+    assert derived is not None, "derived metadata row must exist"
+    joined = " | ".join(derived)
+    assert "_get_models_cache_path" in joined, "must name the catalog cache"
+    assert "threshold_tokens" in joined, "must name the usage-sourced limit"
+
+
+# (file, symbol, source probe) — the RFC-cited symbol plus a definition-shaped
+# substring that must exist in that file, so a rename that leaves the old name
+# behind in a comment still fails. Probes are never line numbers (#5513, #5542).
 SOURCE_ANCHORS = [
-    ("api/config.py", "ACTIVE_RUNS"),
-    ("api/config.py", "STREAMS"),
-    ("api/config.py", "SESSION_INDEX_FILE"),
-    ("api/config.py", "_get_models_cache_path"),
-    ("api/models.py", "pending_user_message"),
-    ("api/models.py", "context_messages"),
-    ("api/run_journal.py", "RUN_JOURNAL_DIR_NAME"),
-    ("api/turn_journal.py", "TURN_JOURNAL_DIR_NAME"),
-    ("api/session_recovery.py", "recover_session"),
-    ("api/compression_anchor.py", "is_context_compression_marker"),
+    ("api/config.py", "ACTIVE_RUNS", "ACTIVE_RUNS: dict = {}"),
+    ("api/config.py", "STREAMS", "STREAMS: dict = {}"),
+    ("api/config.py", "SESSION_INDEX_FILE", "SESSION_INDEX_FILE = SESSION_DIR"),
+    ("api/config.py", "_get_models_cache_path", "def _get_models_cache_path"),
+    ("api/models.py", "pending_user_message", "session.pending_user_message"),
+    ("api/models.py", "context_messages", "self.context_messages ="),
+    ("api/run_journal.py", "RUN_JOURNAL_DIR_NAME", 'RUN_JOURNAL_DIR_NAME = "_run_journal"'),
+    ("api/turn_journal.py", "TURN_JOURNAL_DIR_NAME", 'TURN_JOURNAL_DIR_NAME = "_turn_journal"'),
+    ("api/session_recovery.py", "recover_session", "def recover_session"),
+    (
+        "api/compression_anchor.py",
+        "is_context_compression_marker",
+        "def is_context_compression_marker",
+    ),
+    ("static/boot.js", "threshold_tokens", "S.session.threshold_tokens=data.session.threshold_tokens"),
 ]
 
 
 def test_rfc_source_anchors_land_on_real_symbols():
-    text = _rfc()
-    for rel, symbol in SOURCE_ANCHORS:
+    """Anchors must exist as a real definition in their file AND be cited
+    inside the layer tables, not somewhere else in the prose."""
+    layers_section = _section(_rfc(), "## State Layers")
+    for rel, symbol, probe in SOURCE_ANCHORS:
         source = (ROOT / rel).read_text(encoding="utf-8")
-        assert symbol in source, f"{rel} must still define {symbol!r}"
-        assert symbol in text, (
-            f"RFC must name {symbol!r} as a symbol anchor (not a line number)"
+        assert probe in source, f"{rel} must still define {symbol!r} ({probe!r})"
+        assert symbol in layers_section, (
+            f"the state-layer tables must cite {symbol!r} as a symbol anchor "
+            "(not a line number)"
         )
 
 

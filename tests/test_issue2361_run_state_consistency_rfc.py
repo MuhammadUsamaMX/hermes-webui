@@ -98,6 +98,7 @@ def test_rfc_authority_matrix_covers_every_state_layer():
         "Compression summary",
         "Live UI scene",
         "Sidebar/session metadata",
+        "Client-side unread stores",
         "Derived model/context metadata",
     ]
     missing = [
@@ -151,6 +152,16 @@ SOURCE_ANCHORS = [
         "def is_context_compression_marker",
     ),
     ("static/boot.js", "threshold_tokens", "S.session.threshold_tokens=data.session.threshold_tokens"),
+    (
+        "static/sessions.js",
+        "SESSION_VIEWED_COUNTS_KEY",
+        "const SESSION_VIEWED_COUNTS_KEY = 'hermes-session-viewed-counts';",
+    ),
+    (
+        "static/sessions.js",
+        "SESSION_COMPLETION_UNREAD_KEY",
+        "const SESSION_COMPLETION_UNREAD_KEY = 'hermes-session-completion-unread';",
+    ),
 ]
 
 

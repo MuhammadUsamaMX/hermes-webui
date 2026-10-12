@@ -56,6 +56,27 @@ _SNAPSHOT_ARGS_MAX_DEPTH = 8
 _SNAPSHOT_ARGS_MAX_STRING_CHARS = 8192
 _SNAPSHOT_ARGS_MAX_TOTAL_CHARS = 64 * 1024
 _SNAPSHOT_ARGS_TRUNCATED_SUFFIX = "...[truncated]"
+# Retention policy for the on-disk run journal (#7613). A long-lived/pinned
+# session appends one ``{run_id}.jsonl`` per run and only ever cleaned up when
+# the WHOLE session was deleted, so journals grew without bound (916 MB on one
+# real install). The sweep retires only runs whose OWN last event is terminal
+# (completed / interrupted-by-user / errored / …) — a non-terminal run is a
+# crashed-run recovery payload and is NEVER touched. Age is read from each
+# FILE's own mtime (never the directory mtime, which an active writer keeps
+# fresh). Both the age and the size-cap can be tuned / disabled via env.
+_RUN_JOURNAL_RETENTION_ENV = "HERMES_WEBUI_RUN_JOURNAL_RETENTION"
+_RUN_JOURNAL_MAX_AGE_ENV = "HERMES_WEBUI_RUN_JOURNAL_MAX_AGE_DAYS"
+_RUN_JOURNAL_MAX_SIZE_ENV = "HERMES_WEBUI_RUN_JOURNAL_MAX_SIZE_MB"
+_RUN_JOURNAL_SWEEP_INTERVAL_ENV = "HERMES_WEBUI_RUN_JOURNAL_SWEEP_INTERVAL"
+_DEFAULT_MAX_AGE_DAYS = 14.0
+_DEFAULT_MAX_SIZE_MB = 256.0
+_DEFAULT_SWEEP_INTERVAL_SECONDS = 3600.0
+# Tail read used by the terminal predicate: the last JSONL row of a finished
+# run is always its terminal event (done/cancel/apperror/error/stream_end are
+# all terminal and appended last), so a single bounded tail read is enough to
+# classify a file without parsing megabytes of tool output.
+_TERMINAL_PROBE_READ_BYTES = 64 * 1024
+_OFF_VALUES = frozenset({"off", "0", "false", "no", "disabled"})
 
 
 def _default_session_dir() -> Path:
@@ -755,6 +776,198 @@ def delete_run_journal(session_id: str, *, session_dir: Path | None = None) -> b
             for cache_key in [entry for entry in _SUMMARY_CACHE if str(Path(entry).parent) == dir_key]:
                 del _SUMMARY_CACHE[cache_key]
     return removed
+
+
+def _last_event_is_terminal(path: Path) -> bool:
+    """O(1) terminal probe: read only the file's final JSONL row.
+
+    A finished run's last event is always terminal (``done`` / ``cancel`` /
+    ``apperror`` / ``error`` / ``stream_end`` are all terminal and appended
+    last). A crashed/in-flight run's last row is a non-terminal token/partial,
+    so this returns ``False`` and the file is never retired. Reads a bounded
+    tail so classifying a multi-megabyte journal stays cheap.
+    """
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            if size == 0:
+                return False
+            fh.seek(max(0, size - _TERMINAL_PROBE_READ_BYTES))
+            chunk = fh.read(_TERMINAL_PROBE_READ_BYTES)
+    except OSError:
+        return False
+    lines = [line for line in chunk.split(b"\n") if line.strip()]
+    if not lines:
+        return False
+    try:
+        event = json.loads(lines[-1].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return bool(isinstance(event, dict) and event.get("terminal"))
+
+
+def _retire_run_journal_file(path: Path) -> bool:
+    """Safely remove one terminal run file and evict its in-process caches.
+
+    Re-checks the terminal predicate immediately before unlinking so a file the
+    sweep already classified can never be removed if a writer appended a
+    non-terminal event in between. Takes the per-path writer lock so a live
+    append (if any) serializes against the removal, then drops the writer-lock,
+    seq-cache, and summary-cache entries keyed to this exact file so the next
+    run at the same path restarts clean.
+    """
+    try:
+        path.stat()
+    except OSError:
+        return False
+    if not _last_event_is_terminal(path):
+        return False
+    with _lock_for(path):
+        try:
+            path.unlink()
+        except OSError:
+            return False
+    parent_key = str(path.parent)
+    file_key = str(path)
+    with _WRITER_LOCKS_GUARD:
+        for key in [k for k in _WRITER_LOCKS if k[0] == parent_key and k[1] == path.name]:
+            del _WRITER_LOCKS[key]
+    with _SEQ_CACHE_LOCK:
+        _SEQ_CACHE.pop(file_key, None)
+    with _SUMMARY_CACHE_LOCK:
+        _SUMMARY_CACHE.pop(file_key, None)
+    return True
+
+
+def _env_float(env_name: str, default: float) -> float:
+    raw = os.environ.get(env_name)
+    if raw is None:
+        return default
+    try:
+        return float(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def run_journal_retention_enabled() -> bool:
+    """Retention is on by default; ``HERMES_WEBUI_RUN_JOURNAL_RETENTION=off`` disables it."""
+    return str(os.environ.get(_RUN_JOURNAL_RETENTION_ENV, "")).strip().lower() not in _OFF_VALUES
+
+
+def sweep_run_journals(
+    session_dir: Path | None = None,
+    *,
+    max_age_days: float | None = None,
+    max_size_mb: float | None = None,
+    now: float | None = None,
+) -> dict:
+    """Retire terminal run-journal files that exceed the age or size policy.
+
+    Two independent triggers, both restricted to files whose OWN last event is
+    terminal (``_last_event_is_terminal``); non-terminal recovery payloads are
+    never removed:
+
+    * **age** — file mtime older than ``max_age_days`` (default 14, env
+      ``…_MAX_AGE_DAYS``).
+    * **size** — after the age pass, if the journal root still exceeds
+      ``max_size_mb`` (default 256, env ``…_MAX_SIZE_MB``; ``<=0`` disables),
+      retire the OLDEST remaining terminal files until it fits.
+
+    Returns ``{"scanned", "removed", "removed_bytes"}``. Safe to call
+    concurrently with live appends: only terminal files are touched, age comes
+    from each file's own mtime, and removal takes the per-path writer lock.
+    """
+    if not run_journal_retention_enabled():
+        return {"scanned": 0, "removed": 0, "removed_bytes": 0}
+    root = Path(session_dir) if session_dir is not None else _default_session_dir()
+    journal_root = root / RUN_JOURNAL_DIR_NAME
+    if not journal_root.exists():
+        return {"scanned": 0, "removed": 0, "removed_bytes": 0}
+    age_days = _env_float(_RUN_JOURNAL_MAX_AGE_ENV, _DEFAULT_MAX_AGE_DAYS) if max_age_days is None else float(max_age_days)
+    size_mb = _env_float(_RUN_JOURNAL_MAX_SIZE_ENV, _DEFAULT_MAX_SIZE_MB) if max_size_mb is None else float(max_size_mb)
+    now = time.time() if now is None else float(now)
+    max_age_seconds = max(0.0, age_days) * 86400.0
+    max_size_bytes = None if size_mb <= 0 else int(size_mb * 1024 * 1024)
+
+    terminal_files: list[tuple[float, int, Path]] = []
+    total_size = 0
+    scanned = 0
+    for path in journal_root.glob("*/*.jsonl"):
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        scanned += 1
+        total_size += st.st_size
+        if _last_event_is_terminal(path):
+            terminal_files.append((st.st_mtime, st.st_size, path))
+
+    doomed: set[Path] = set()
+    # Age trigger: terminal files past the age limit.
+    if max_age_seconds > 0:
+        for mtime, _size, path in terminal_files:
+            if now - mtime >= max_age_seconds:
+                doomed.add(path)
+    # Size trigger: retire oldest remaining terminal files until under the cap.
+    if max_size_bytes is not None:
+        remaining = total_size - sum(size for _mt, size, path in terminal_files if path in doomed)
+        if remaining > max_size_bytes:
+            for _mtime, size, path in sorted(terminal_files, key=lambda item: item[0]):
+                if path in doomed:
+                    continue
+                if remaining <= max_size_bytes:
+                    break
+                doomed.add(path)
+                remaining -= size
+
+    removed = 0
+    removed_bytes = 0
+    for _mtime, size, path in terminal_files:
+        if path in doomed and _retire_run_journal_file(path):
+            removed += 1
+            removed_bytes += size
+    return {"scanned": scanned, "removed": removed, "removed_bytes": removed_bytes}
+
+
+# Background sweeper thread state (mirrors the SessionChannel reaper pattern).
+_RUN_JOURNAL_SWEEP_THREAD: threading.Thread | None = None
+_RUN_JOURNAL_SWEEP_LOCK = threading.Lock()
+_RUN_JOURNAL_SWEEP_STOP = threading.Event()
+
+
+def _run_journal_sweep_loop() -> None:
+    while not _RUN_JOURNAL_SWEEP_STOP.wait(
+        max(60.0, _env_float(_RUN_JOURNAL_SWEEP_INTERVAL_ENV, _DEFAULT_SWEEP_INTERVAL_SECONDS))
+    ):
+        try:
+            sweep_run_journals()
+        except Exception:
+            # Never let a transient error kill the sweeper thread.
+            pass
+
+
+def start_run_journal_sweeper() -> bool:
+    """Start the background run-journal retention sweeper. Idempotent; True on first start."""
+    global _RUN_JOURNAL_SWEEP_THREAD
+    with _RUN_JOURNAL_SWEEP_LOCK:
+        if _RUN_JOURNAL_SWEEP_THREAD is not None and _RUN_JOURNAL_SWEEP_THREAD.is_alive():
+            return False
+        _RUN_JOURNAL_SWEEP_STOP.clear()
+        _RUN_JOURNAL_SWEEP_THREAD = threading.Thread(
+            target=_run_journal_sweep_loop,
+            name="hermes-webui-run-journal-sweeper",
+            daemon=True,
+        )
+        _RUN_JOURNAL_SWEEP_THREAD.start()
+        return True
+
+
+def stop_run_journal_sweeper(timeout: float = 2.0) -> None:
+    _RUN_JOURNAL_SWEEP_STOP.set()
+    thread = _RUN_JOURNAL_SWEEP_THREAD
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=timeout)
 
 
 def stale_interrupted_event(session_id: str, run_id: str, *, after_seq: int | None = None) -> dict | None:

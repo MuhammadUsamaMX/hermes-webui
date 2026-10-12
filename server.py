@@ -663,6 +663,13 @@ def main() -> None:
         print(f'[!!] WARNING: SessionChannel reaper failed to start: {e}', flush=True)
 
     try:
+        from api.run_journal import start_run_journal_sweeper
+        if start_run_journal_sweeper():
+            print('[ok] Run-journal retention sweeper started', flush=True)
+    except Exception as e:
+        print(f'[!!] WARNING: Run-journal retention sweeper failed to start: {e}', flush=True)
+
+    try:
         from api.plugins import load_plugins
         load_plugins()
     except Exception as e:
@@ -745,5 +752,10 @@ def main() -> None:
             stop_session_channel_reaper()
         except Exception:
             logger.debug("Failed to stop SessionChannel reaper during shutdown", exc_info=True)
+        try:
+            from api.run_journal import stop_run_journal_sweeper
+            stop_run_journal_sweeper()
+        except Exception:
+            logger.debug("Failed to stop run-journal sweeper during shutdown", exc_info=True)
 if __name__ == '__main__':
     main()

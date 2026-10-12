@@ -5737,6 +5737,8 @@ function _reasoningEffortContext(){
     const ctx={};
     if(transition.model) ctx.model=transition.model;
     if(transition.provider) ctx.provider=transition.provider;
+    // Mid-profile-switch the chip previews the target profile's default, so a
+    // session id from the OLD profile must not be attached.
     return ctx;
   }
   const sel=$('modelSelect');
@@ -5748,6 +5750,11 @@ function _reasoningEffortContext(){
   const ctx={};
   if(model) ctx.model=model;
   if(provider) ctx.provider=provider;
+  // #2697: reasoning effort is per-conversation. Sending the session id scopes
+  // both the read (which override the chip shows) and the write (which
+  // session the pick lands on); without it the profile default would change
+  // for every other session.
+  if(session&&session.session_id) ctx.session_id=session.session_id;
   return ctx;
 }
 

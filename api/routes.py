@@ -3004,6 +3004,7 @@ from api.config import (
     get_reasoning_status,
     set_reasoning_display,
     set_reasoning_effort,
+    normalize_reasoning_effort,
     create_stream_channel,
     publish_pre_admission_claim,
     retire_pre_admission_claim_if_owned,
@@ -15094,16 +15095,20 @@ def handle_get(handler, parsed) -> bool:
         # Current reasoning config (shared source of truth with the CLI —
         # reads display.show_reasoning and agent.reasoning_effort from
         # the active profile's config.yaml).
+        # #2697: with a session_id the per-session override shadows the profile
+        # default, and effort_scope says which one the chip is looking at.
         query = parse_qs(parsed.query)
         model_id = (query.get("model", [""])[0] or "").strip() or None
         provider_id = (query.get("provider", [""])[0] or "").strip() or None
         base_url = (query.get("base_url", [""])[0] or "").strip() or None
+        session_id = (query.get("session_id", [""])[0] or "").strip()
         return j(
             handler,
             get_reasoning_status(
                 model_id=model_id,
                 provider_id=provider_id,
                 base_url=base_url,
+                session_effort=_session_reasoning_effort(session_id),
             ),
         )
 
@@ -16031,6 +16036,24 @@ def _validate_session_toolsets_shape(toolsets):
     return toolsets
 
 
+def _session_reasoning_effort(session_id):
+    """Return the per-session reasoning effort override (#2697), or None.
+
+    None means "no override for this conversation" — the caller falls back to
+    the profile's ``agent.reasoning_effort`` default. A missing session and an
+    un-overridden session are the same answer, so a stale tab id can never
+    accidentally rewrite another conversation's reasoning.
+    """
+    sid = str(session_id or "").strip()
+    if not sid:
+        return None
+    try:
+        session = get_session(sid, metadata_only=True)
+    except Exception:
+        return None
+    return str(getattr(session, "reasoning_effort", "") or "").strip().lower() or None
+
+
 def _resolve_new_session_workspace(body, visible_prev_session_id, profile=None):
     """Resolve a new-session workspace, recovering only verified inheritance."""
     candidate = body.get("workspace")
@@ -16861,6 +16884,31 @@ def handle_post(handler, parsed) -> bool:
                 model_id = str(body.get("model") or "").strip() or None
                 provider_id = str(body.get("provider") or "").strip() or None
                 base_url = str(body.get("base_url") or "").strip() or None
+                session_id = str(body.get("session_id") or "").strip()
+                if session_id:
+                    # #2697: the effort belongs to THIS conversation. Persist it
+                    # on the session and leave agent.reasoning_effort alone so
+                    # every other session keeps the profile default.
+                    try:
+                        scoped_effort = normalize_reasoning_effort(effort)
+                    except ValueError as e:
+                        return bad(handler, str(e))
+                    try:
+                        scoped_session = get_session(session_id)
+                    except KeyError:
+                        return bad(handler, "Session not found", 404)
+                    with _get_session_agent_lock(session_id):
+                        scoped_session.reasoning_effort = scoped_effort or None
+                        scoped_session.save()
+                    return j(
+                        handler,
+                        get_reasoning_status(
+                            model_id=model_id,
+                            provider_id=provider_id,
+                            base_url=base_url,
+                            session_effort=scoped_session.reasoning_effort,
+                        ),
+                    )
                 return j(
                     handler,
                     set_reasoning_effort(
@@ -17632,6 +17680,7 @@ def handle_post(handler, parsed) -> bool:
             project_id=getattr(source, "project_id", None),
             personality=getattr(source, "personality", None),
             enabled_toolsets=getattr(source, "enabled_toolsets", None),
+            reasoning_effort=getattr(source, "reasoning_effort", None),
             context_length=getattr(source, "context_length", None),
             threshold_tokens=getattr(source, "threshold_tokens", None),
             # context_messages — truncated to fork prefix (not full parent copy)
@@ -26234,6 +26283,7 @@ def _handle_session_compression_recovery_start(handler, body):
                 session_source="fork",
                 personality=getattr(source, "personality", None),
                 enabled_toolsets=copy.deepcopy(getattr(source, "enabled_toolsets", None)),
+                reasoning_effort=getattr(source, "reasoning_effort", None),
                 context_length=getattr(source, "context_length", None),
                 threshold_tokens=getattr(source, "threshold_tokens", None),
                 gateway_routing=copy.deepcopy(getattr(source, "gateway_routing", None)),

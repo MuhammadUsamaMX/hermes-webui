@@ -5995,19 +5995,31 @@ def get_reasoning_status(
     model_id: str | None = None,
     provider_id: str | None = None,
     base_url: str | None = None,
+    session_effort: str | None = None,
 ) -> dict:
     """Return current reasoning configuration from the active profile's
     config.yaml — the same source of truth the CLI reads from.
 
     Keys:
       - show_reasoning: bool — from ``display.show_reasoning`` (default True)
-      - reasoning_effort: str — from ``agent.reasoning_effort`` ('' = default)
+      - reasoning_effort: str — the ACTIVE effort ('' = default)
+      - effort_scope: 'session' | 'default' — where that effort came from
+
+    ``session_effort`` is the per-session override (#2697). A non-empty value
+    wins over ``agent.reasoning_effort`` so one conversation can raise its
+    reasoning without touching the profile default the other sessions use.
     """
     config_data = _load_yaml_config_file(_get_config_path())
     display_cfg = config_data.get("display") or {}
     agent_cfg = config_data.get("agent") or {}
     show_raw = display_cfg.get("show_reasoning") if isinstance(display_cfg, dict) else None
     effort_raw = agent_cfg.get("reasoning_effort") if isinstance(agent_cfg, dict) else None
+    # #2697: a per-session override shadows the profile default for THIS
+    # conversation only. An empty override is the same as no override, so a
+    # cleared session silently falls back to agent.reasoning_effort.
+    session_effort_raw = str(session_effort or "").strip().lower()
+    if session_effort_raw:
+        effort_raw = session_effort_raw
 
     resolve_model = model_id
     resolve_provider = provider_id
@@ -6048,6 +6060,9 @@ def get_reasoning_status(
             provider_id=resolve_provider,
             base_url=resolve_base_url,
         ),
+        # #2697: tell the UI whether the reported effort is this conversation's
+        # override or the profile default, so the chip can label/scope it.
+        "effort_scope": "session" if session_effort_raw else "default",
         "supported_efforts": supported_efforts,
         "supports_reasoning_effort": bool(supported_efforts),
         # Whether the composer should render ANY reasoning control. True for any
@@ -6154,6 +6169,22 @@ def set_reasoning_display(show: bool) -> dict:
     return get_reasoning_status()
 
 
+def normalize_reasoning_effort(effort) -> str:
+    """Return a normalized reasoning effort ('' = clear the override).
+
+    Raises ``ValueError`` on any unrecognised level so callers can 400. Shared
+    by the profile-wide setter (``set_reasoning_effort``) and the per-session
+    override setter (#2697) so both accept exactly the same levels.
+    """
+    raw = str(effort or "").strip().lower()
+    if raw and raw != "none" and raw not in VALID_REASONING_EFFORTS:
+        raise ValueError(
+            f"Unknown reasoning effort '{effort}'. "
+            f"Valid: none, {', '.join(VALID_REASONING_EFFORTS)}."
+        )
+    return raw
+
+
 def set_reasoning_effort(
     effort: str,
     *,
@@ -6175,12 +6206,7 @@ def set_reasoning_effort(
 
     Raises ``ValueError`` on any other unrecognised level so callers can 400.
     """
-    raw = str(effort or "").strip().lower()
-    if raw and raw != "none" and raw not in VALID_REASONING_EFFORTS:
-        raise ValueError(
-            f"Unknown reasoning effort '{effort}'. "
-            f"Valid: none, {', '.join(VALID_REASONING_EFFORTS)}."
-        )
+    raw = normalize_reasoning_effort(effort)
     config_path = _get_config_path()
     with _cfg_lock:
         config_data = _load_yaml_config_file(config_path)

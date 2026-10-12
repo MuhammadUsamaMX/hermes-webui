@@ -2046,11 +2046,14 @@ function cmdReasoning(args){
     return true;
   }
   if(EFFORTS.includes(arg)){
-    // Persist via /api/reasoning → config.yaml agent.reasoning_effort.
-    // Takes effect on the NEXT session/turn (agent re-reads config at
-    // construction time), matching CLI semantics where `/reasoning high`
-    // also forces an agent re-init.
-    api('/api/reasoning',{method:'POST',body:JSON.stringify({effort:arg})})
+    // Persist via /api/reasoning → this conversation's reasoning override
+    // (#2697). The active session id rides along so the pick is scoped to the
+    // conversation being typed in; with no session yet the write lands on the
+    // profile default, which is exactly the "new sessions use the default"
+    // behaviour. Takes effect on the NEXT turn (agent re-reads at
+    // construction time), matching CLI `/reasoning high` semantics.
+    const _ctx=(typeof _reasoningEffortContext==='function')?_reasoningEffortContext():{};
+    api('/api/reasoning',{method:'POST',body:JSON.stringify(Object.assign({effort:arg},_ctx))})
       .then(function(st){
         const eff=(st && st.reasoning_effort)||arg;
         showToast(BRAIN+' Reasoning effort: '+eff+' (saved; applies to next turn)');

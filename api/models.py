@@ -1507,6 +1507,7 @@ class Session:
                  worktree_repo_root=None,
                  worktree_created_at=None,
                  enabled_toolsets=None,
+                 reasoning_effort=None,
                  composer_draft=None,
                  anchor_activity_scenes=None,
                  process_wakeup_pause=None,
@@ -1624,6 +1625,9 @@ class Session:
         self.source_label = kwargs.get('source_label')
         self.read_only = bool(kwargs.get('read_only', False))
         self.enabled_toolsets = enabled_toolsets  # List[str] or None — per-session toolset override
+        # #2697: per-session reasoning effort override ('none'|'minimal'|... or
+        # None = follow the profile's agent.reasoning_effort default).
+        self.reasoning_effort = str(reasoning_effort).strip().lower() or None if reasoning_effort else None
         self.composer_draft = composer_draft if isinstance(composer_draft, dict) else {}
         self.anchor_activity_scenes = anchor_activity_scenes if isinstance(anchor_activity_scenes, dict) else {}
         self.process_wakeup_pause = process_wakeup_pause if isinstance(process_wakeup_pause, dict) else {}
@@ -1712,7 +1716,7 @@ class Session:
             'parent_session_id',
             'worktree_path', 'worktree_branch', 'worktree_repo_root', 'worktree_created_at',
             'is_cli_session', 'source_tag', 'raw_source', 'session_source', 'source_label', 'read_only',
-            'enabled_toolsets', 'composer_draft',
+            'enabled_toolsets', 'reasoning_effort', 'composer_draft',
             'process_wakeup_pause',
             'share_token', 'share_created_at',
             'gateway_run',
@@ -2242,6 +2246,7 @@ class Session:
             'source_label': self.source_label,
             'read_only': self.read_only,
             'enabled_toolsets': self.enabled_toolsets,
+            'reasoning_effort': getattr(self, 'reasoning_effort', None),
             'composer_draft': self.composer_draft if isinstance(self.composer_draft, dict) else {},
             'process_wakeup_pause': self.process_wakeup_pause if isinstance(self.process_wakeup_pause, dict) else {},
             'share_token': self.share_token,
@@ -6583,7 +6588,7 @@ def _profile_default_model_state(profile=None):
     return default_model or get_effective_default_model(), default_provider
 
 
-def new_session(workspace=None, model=None, profile=None, model_provider=None, project_id=None, worktree_info=None, enabled_toolsets=None):
+def new_session(workspace=None, model=None, profile=None, model_provider=None, project_id=None, worktree_info=None, enabled_toolsets=None, reasoning_effort=None):
     """Create a new in-memory session.
 
     The session lives in the SESSIONS dict only — no disk write happens until
@@ -6637,6 +6642,7 @@ def new_session(workspace=None, model=None, profile=None, model_provider=None, p
         worktree_repo_root=wt.get('repo_root') if wt else None,
         worktree_created_at=wt.get('created_at') if wt else None,
         enabled_toolsets=enabled_toolsets,
+        reasoning_effort=reasoning_effort,
     )
     # #4985: defensive — auto-generated uuids don't collide with the
     # tombstone, but if a future caller ever passes an explicit id that

@@ -361,12 +361,20 @@ def _gateway_use_runs_api_enabled(config_data=None, environ: dict[str, str] | No
     return raw in ("1", "true", "yes", "on")
 
 
-def _gateway_reasoning_effort_for_request(cfg, *, model=None, model_provider=None):
-    """Read and coerce user-configured reasoning effort for a gateway request."""
+def _gateway_reasoning_effort_for_request(cfg, *, model=None, model_provider=None, session_effort=None):
+    """Read and coerce user-configured reasoning effort for a gateway request.
+
+    ``session_effort`` is the per-session override (#2697); a non-empty value
+    wins over the profile's ``agent.reasoning_effort`` default so one
+    conversation can raise its reasoning without touching the others.
+    """
     try:
         cfg_data = cfg if isinstance(cfg, dict) else {}
         effort_cfg = cfg_data.get("agent", {}) if isinstance(cfg_data, dict) else {}
         effort_raw = effort_cfg.get("reasoning_effort") if isinstance(effort_cfg, dict) else None
+        scoped = str(session_effort or "").strip().lower()
+        if scoped:
+            effort_raw = scoped
         coerced = coerce_reasoning_effort_for_model(
             effort_raw,
             model,
@@ -2070,6 +2078,9 @@ def _run_gateway_chat_streaming(
             cfg,
             model=model,
             model_provider=model_provider,
+            # #2697: honour the session's own reasoning override before the
+            # profile default.
+            session_effort=str(getattr(s, "reasoning_effort", "") or "").strip() or None,
         )
         base_url, api_key = reattach_endpoint or (_gateway_base_url(cfg), _gateway_api_key())
         with _STREAM_RUN_STARTING_CONDITION:

@@ -12974,20 +12974,26 @@ def _run_agent_streaming(
 
             # Per-session toolset override (#493): if the session has
             # enabled_toolsets set, use that instead of the global config.
+            # Session metadata is loaded once here and reused by the
+            # per-session reasoning override below (#2697).
+            _session_meta = None
             try:
                 from api.models import Session, SESSION_DIR
                 _session_path = SESSION_DIR / f"{session_id}.json"
                 if _session_path.exists():
                     _session_meta = Session.load_metadata_only(session_id)
-                    # load_metadata_only returns a Session INSTANCE, not a dict.
-                    # The previous .get('enabled_toolsets') raised AttributeError
-                    # which was swallowed by the bare except below — the entire
-                    # per-session toolset override silently no-op'd. Use
-                    # getattr() to read the attribute correctly.
-                    # (Opus pre-release advisor finding for v0.50.257.)
-                    _override = getattr(_session_meta, 'enabled_toolsets', None) if _session_meta else None
-                    if _override:
-                        _toolsets = _override
+            except Exception as _sm_err:
+                print(f"[webui] WARNING: failed to read session metadata for {session_id}: {_sm_err}", flush=True)
+            try:
+                # load_metadata_only returns a Session INSTANCE, not a dict.
+                # The previous .get('enabled_toolsets') raised AttributeError
+                # which was swallowed by the bare except below — the entire
+                # per-session toolset override silently no-op'd. Use
+                # getattr() to read the attribute correctly.
+                # (Opus pre-release advisor finding for v0.50.257.)
+                _override = getattr(_session_meta, 'enabled_toolsets', None) if _session_meta else None
+                if _override:
+                    _toolsets = _override
             except Exception as _ts_err:
                 print(f"[webui] WARNING: failed to read per-session toolsets for {session_id}: {_ts_err}", flush=True)
 
@@ -13092,6 +13098,14 @@ def _run_agent_streaming(
             try:
                 _effort_cfg = _cfg.get('agent', {}) if isinstance(_cfg, dict) else {}
                 _effort_raw = _effort_cfg.get('reasoning_effort') if isinstance(_effort_cfg, dict) else None
+                # #2697: a per-session override shadows the profile default, so
+                # reasoning effort belongs to THIS conversation only. New
+                # sessions have no override and keep agent.reasoning_effort.
+                _session_effort = str(
+                    getattr(_session_meta, 'reasoning_effort', '') or ''
+                ).strip().lower() if _session_meta else ''
+                if _session_effort:
+                    _effort_raw = _session_effort
                 _effort = coerce_reasoning_effort_for_model(
                     _effort_raw,
                     resolved_model,

@@ -26292,16 +26292,38 @@ function resolveLocale(lang) {
 }
 
 /**
+ * Detect the browser's preferred locale (#7622).
+ * Walks navigator.languages in the order the browser ranked them and returns
+ * the first tag that resolves to a known LOCALES key. Returns null when nothing
+ * matches — or when `navigator` is unavailable (tests, non-browser contexts).
+ * @returns {string|null}
+ */
+function detectBrowserLocale() {
+  try {
+    const langs = (navigator.languages && navigator.languages.length)
+      ? navigator.languages
+      : [navigator.language];
+    for (const tag of langs) {
+      const hit = resolveLocale(tag);
+      if (hit) return hit;
+    }
+  } catch (_) {}
+  return null;
+}
+
+/**
  * Resolve locale with precedence:
- * 1) primary (typically server setting)
- * 2) fallback (typically localStorage)
- * 3) English
+ * 1) primary (typically server setting — empty means "no explicit choice")
+ * 2) fallback (typically localStorage — an explicit user choice)
+ * 3) the browser's own language list, so a fresh install (#7622) starts in the
+ *    user's language instead of always English
+ * 4) English
  * @param {string} primary
  * @param {string} fallback
  * @returns {string}
  */
 function resolvePreferredLocale(primary, fallback) {
-  return resolveLocale(primary) || resolveLocale(fallback) || 'en';
+  return resolveLocale(primary) || resolveLocale(fallback) || detectBrowserLocale() || 'en';
 }
 
 /**

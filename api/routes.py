@@ -10944,6 +10944,42 @@ def _resolve_login_locale_key(raw_lang: str | None) -> str:
             return key
     return "en"
 
+
+def _login_locale_from_accept_language(header: str | None) -> str | None:
+    """Pick a login-page locale from the browser's Accept-Language header (#7622).
+
+    Used while `settings.language` is still empty (a fresh install), so the very
+    first page a new user sees is already in their own language. Entries are
+    tried in the browser's own preference order (quality value, highest first).
+    Returns None when the header is absent or names no locale _LOGIN_LOCALE knows.
+    """
+    if not header:
+        return None
+    candidates: list[tuple[float, str]] = []
+    for part in str(header).split(","):
+        tag, _, params = part.partition(";")
+        tag = tag.strip().strip('"')
+        if not tag or tag == "*":
+            continue
+        quality = 1.0
+        for param in params.split(";"):
+            param = param.strip()
+            if not param.startswith("q="):
+                continue
+            try:
+                quality = float(param[2:])
+            except ValueError:
+                quality = 0.0
+        if quality > 0:
+            candidates.append((quality, tag))
+    for _, tag in sorted(candidates, key=lambda c: -c[0]):
+        key = _resolve_login_locale_key(tag)
+        # _resolve_login_locale_key falls back to "en" for anything unknown, so
+        # only trust that result when the tag really is an English tag.
+        if key != "en" or tag.replace("_", "-").split("-")[0].lower() == "en":
+            return key
+    return None
+
 # ── Login page (self-contained, no external deps) ────────────────────────────
 _LOGIN_PAGE_HTML = """<!doctype html>
 <html lang="{{LANG}}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -12930,10 +12966,19 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == "/login":
         _settings = load_settings()
         _bn = _html.escape(_settings.get("bot_name") or "Hermes")
-        _lang = _settings.get("language", "en")
-        _login_strings = _LOGIN_LOCALE[
-            _resolve_login_locale_key(_lang)
-        ]
+        # An empty language setting means "no explicit choice yet" — greet a
+        # fresh install in the visitor's own language (#7622).
+        _lang = str(_settings.get("language") or "").strip()
+        if _lang:
+            _login_locale_key = _resolve_login_locale_key(_lang)
+        else:
+            _login_locale_key = (
+                _login_locale_from_accept_language(
+                    handler.headers.get("Accept-Language")
+                )
+                or "en"
+            )
+        _login_strings = _LOGIN_LOCALE[_login_locale_key]
         from urllib.parse import quote
         from api.updates import WEBUI_VERSION
         version_token = quote(WEBUI_VERSION, safe="")

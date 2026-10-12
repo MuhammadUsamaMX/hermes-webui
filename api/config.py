@@ -9700,7 +9700,10 @@ _SETTINGS_DEFAULTS = {
     "hidden_tabs": [],  # sidebar tab panel names hidden by user (e.g. ["tasks","kanban"]); chat and settings are always visible
     "tab_order": [],  # user-defined sidebar/rail tab order for reorderable tabs; chat/settings stay fixed
     "composer_control_order": [],  # user-defined composer footer control order; invalid/duplicate keys are ignored
-    "language": "en",  # UI locale code; must match a key in static/i18n.js LOCALES
+    # UI locale code; must match a key in static/i18n.js LOCALES.
+    # "" = no explicit choice yet: the client picks from the browser's language
+    # list on first visit instead of forcing English (#7622).
+    "language": "",
     "bot_name": os.getenv(
         "HERMES_WEBUI_BOT_NAME", "Hermes"
     ),  # display name for the assistant
@@ -10202,8 +10205,10 @@ def save_settings(settings: dict) -> dict:
             if k == "tts_voice":
                 if not isinstance(v, str) or len(v) > 200 or "\x00" in v:
                     continue
-            # Validate language codes (BCP-47-like: 'en', 'zh', 'fr', 'zh-CN')
-            if k == "language" and (
+            # Validate language codes (BCP-47-like: 'en', 'zh', 'fr', 'zh-CN').
+            # "" is also accepted: it clears the choice so the client falls back
+            # to browser-language detection on the next visit (#7622).
+            if k == "language" and v != "" and (
                 not isinstance(v, str) or not _SETTINGS_LANG_RE.match(v)
             ):
                 continue

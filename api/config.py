@@ -10219,6 +10219,9 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         # 4. Fetch models from custom endpoint if base_url is configured
         auto_detected_models = []
         auto_detected_models_by_provider: dict[str, list[dict]] = {}
+        # Effective credential the active-endpoint probe below will use; the
+        # named loop compares it before reusing a pre-warmed result (#7481).
+        _active_probe_key = ""
         if cfg_base_url:
             base_url = cfg_base_url.strip()
             configured_provider = _configured_provider_for_base_url(base_url)
@@ -10276,6 +10279,8 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     api_key = (all_env.get(key) or _thread_local_env_value(key) or "").strip()
                     if api_key:
                         break
+
+            _active_probe_key = api_key
 
             _trusted_custom_bases: list[object] = [cfg_base_url]
             _custom_providers_for_trust = cfg.get("custom_providers", [])
@@ -10349,6 +10354,21 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     )
                     _live_models = auto_detected_models_by_provider.get(_slug)
                     _live_error = None
+                    # A pre-warmed result was fetched with the ACTIVE
+                    # endpoint's credentials. When this entry declares a
+                    # DIFFERENT key it must probe with its own — inheriting
+                    # the active result would publish models (or a false 401)
+                    # produced with someone else's credentials (#7481
+                    # re-gate). An entry declaring no key keeps the single
+                    # probe: it reaches the same endpoint with the same
+                    # ambient credentials.
+                    if (
+                        _live_models is not None
+                        and _cp_api_key
+                        and _active_probe_key
+                        and _cp_api_key != _active_probe_key
+                    ):
+                        _live_models = None
                     if _cp_has_configured_models:
                         # Skip the live /v1/models probe when an allowlist
                         # exists — the curated list wins and probe failures

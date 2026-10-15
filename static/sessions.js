@@ -4906,6 +4906,7 @@ async function _loadOlderMessages() {
   // bails out so we never prepend stale older messages onto a freshly
   // rebuilt transcript (#1937).
   const startGeneration = _messagesGeneration;
+  const requestedBeforeOffset = _oldestIdx;
   try {
     // Two strategies, chosen by whether the growing tail window still fits under
     // the server's msg_limit ceiling (_MSG_LIMIT_MAX, mirroring backend
@@ -4928,7 +4929,7 @@ async function _loadOlderMessages() {
     const useBeforePaging = requestedLimit >= _msgLimitMax;
     const data = useBeforePaging
       ? await api(
-          `/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&msg_before=${_oldestIdx}&msg_limit=${_INITIAL_MSG_LIMIT}`,
+          `/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&msg_before=${requestedBeforeOffset}&msg_limit=${_INITIAL_MSG_LIMIT}`,
           {timeoutMs:120000}
         )
       : await api(
@@ -4989,7 +4990,7 @@ async function _loadOlderMessages() {
       // reapplied because we just awaited again (skipped for the reuse case).
       if (!useBeforePaging) {
         const fallback = await api(
-          `/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&msg_before=${_oldestIdx}&msg_limit=${_INITIAL_MSG_LIMIT}`,
+          `/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&msg_before=${requestedBeforeOffset}&msg_limit=${_INITIAL_MSG_LIMIT}`,
           {timeoutMs:120000}
         );
         if (!fallback || !fallback.session) { _loadingOlder = false; return; }
@@ -4998,7 +4999,8 @@ async function _loadOlderMessages() {
         if (_messagesGeneration !== startGeneration) return;
         responseSession = fallback.session;
       }
-      olderMsgs = (responseSession.messages || []).filter(m => m && m.role);
+      const olderRows = Array.isArray(responseSession.messages) ? responseSession.messages : [];
+      olderMsgs = olderRows.filter(m => m && m.role);
       nextMessages = [...olderMsgs, ...S.messages];
     }
     if (!olderMsgs.length) { _messagesTruncated = !!responseSession._messages_truncated; return; }

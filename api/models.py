@@ -10288,6 +10288,12 @@ def merge_session_messages_append_only(
     seen_visible_keys = set()
     sidecar_visible_sequence = []
     sidecar_visible_messages = []
+    # #7587: sidecar row object -> its visible-sequence slot, so any suppression
+    # path that consumes a sidecar row can advance the replay cursor past it.
+    sidecar_visible_index_by_id = {}
+    # #7587: visible key -> every sidecar slot carrying it, so the duplicate
+    # budget below can tell which occurrences the ordered replay still owns.
+    sidecar_visible_indices_by_key = {}
     sidecar_visible_keys = set()
     sidecar_visible_counts = {}
     sidecar_multimodal_mirrors = {}
@@ -10329,6 +10335,10 @@ def merge_session_messages_append_only(
         sidecar_visible_counts[visible_key] = sidecar_visible_counts.get(visible_key, 0) + 1
         sidecar_visible_sequence.append(visible_key)
         sidecar_visible_messages.append(msg)
+        sidecar_visible_index_by_id[id(msg)] = len(sidecar_visible_messages) - 1
+        sidecar_visible_indices_by_key.setdefault(visible_key, []).append(
+            len(sidecar_visible_messages) - 1
+        )
         multimodal_mirror_key = _session_message_multimodal_mirror_key(
             msg,
             require_image_parts=True,
@@ -10376,6 +10386,52 @@ def merge_session_messages_append_only(
                     ambiguous_state_multimodal_mirrors.add(mirror_key)
     state_replay_idx = 0
     skipped_state_visible_counts = {}
+
+    def _replay_cursor_after_consuming(consumed_sidecar_row, cursor):
+        """Advance the visible-prefix replay cursor past a consumed sidecar row.
+
+        #7587: ``state_replay_idx`` tracks how far the state transcript has been
+        matched against the sidecar IN ORDER. A state row can be suppressed by
+        paths other than that ordered replay (the full-precision dedup key, the
+        message-id guard, the row-id fast path, the visible-duplicate budget).
+        Those paths consume a sidecar row but used to leave the cursor behind.
+
+        Once the cursor lags, the NEXT state row is compared against a slot that
+        was already accounted for. Because two turns carrying identical content
+        project the same visible key, a genuine repeat is then mis-claimed as a
+        replay of the earlier turn and silently dropped — real user data loss on
+        the restore path.
+
+        The cursor only ever moves FORWARD, and only to the slot immediately
+        after the row that was actually consumed, so ordered replay and the
+        restamped-twin dedup invariant are unchanged.
+        """
+        if not isinstance(consumed_sidecar_row, dict):
+            return cursor
+        index = sidecar_visible_index_by_id.get(id(consumed_sidecar_row))
+        if index is None or index < cursor:
+            return cursor
+        return index + 1
+
+    def _sidecar_occurrence_still_owned(visible_key, cursor):
+        """Is any sidecar occurrence of ``visible_key`` still ahead of ``cursor``?
+
+        #7587: the visible-duplicate budget lets one state row per sidecar
+        occurrence be suppressed. That is only sound while the ordered replay
+        still OWNS an occurrence to spend. Once the cursor has moved past every
+        slot carrying the key, those occurrences are spoken for — a further
+        state row with the same visible key is a genuine repeat, not a twin of
+        something already accounted for.
+
+        A provider-*restamped* twin keeps deduping because its slot sits far
+        ahead of the cursor, leaving the budget spendable; a genuine repeat that
+        the ordered replay has already walked past is preserved.
+        """
+        indices = sidecar_visible_indices_by_key.get(visible_key)
+        if not indices:
+            return True
+        return any(index >= cursor for index in indices)
+
     # Loop-invariant: a session whose original truncate cutoff (truncation_boundary)
     # is strictly below the watermark is genuinely ADVANCED (a new turn was
     # committed after the edit). In that state post-watermark state.db rows are
@@ -10558,7 +10614,13 @@ def merge_session_messages_append_only(
         # collapsed.  The merge key truncates to seconds; the dedup key does
         # not.
         if dedup_key in seen_dedup_keys:
-            _merge_session_display_metadata(merged_by_dedup_key.get(dedup_key), msg)
+            duplicate_of = merged_by_dedup_key.get(dedup_key)
+            _merge_session_display_metadata(duplicate_of, msg)
+            # #7587: this consumed a sidecar row, so keep the ordered-replay
+            # cursor aligned with what has actually been accounted for.
+            state_replay_idx = _replay_cursor_after_consuming(
+                duplicate_of, state_replay_idx
+            )
             continue
         if max_sidecar_timestamp is not None and timestamp is not None and timestamp <= max_sidecar_timestamp:
             # For message_id keys the merge key is authoritative — skip if
@@ -10566,7 +10628,11 @@ def merge_session_messages_append_only(
             # handled true duplicates; same-second distinct messages must
             # fall through.
             if key in seen_message_keys and key[0] == "message_id":
-                _merge_session_display_metadata(merged_by_message_key.get(key), msg)
+                consumed = merged_by_message_key.get(key)
+                _merge_session_display_metadata(consumed, msg)
+                state_replay_idx = _replay_cursor_after_consuming(
+                    consumed, state_replay_idx
+                )
                 continue
             if not (isinstance(key, tuple) and key[:1] == ("message_id",)):
                 # Legacy key within sidecar timestamp range — only skip if
@@ -10575,10 +10641,18 @@ def merge_session_messages_append_only(
                 # identical content/timestamp, so an unchecked continue here
                 # would drop legitimately distinct turns.  (#3346 / PR #3665)
                 if key in seen_message_keys:
-                    _merge_session_display_metadata(merged_by_message_key.get(key), msg)
+                    consumed = merged_by_message_key.get(key)
+                    _merge_session_display_metadata(consumed, msg)
+                    state_replay_idx = _replay_cursor_after_consuming(
+                        consumed, state_replay_idx
+                    )
                     continue
         if key in seen_message_keys and key[0] == "message_id":
-            _merge_session_display_metadata(merged_by_message_key.get(key), msg)
+            consumed = merged_by_message_key.get(key)
+            _merge_session_display_metadata(consumed, msg)
+            state_replay_idx = _replay_cursor_after_consuming(
+                consumed, state_replay_idx
+            )
             continue
         matched_visible_key = _matching_visible_duplicate(
             visible_key,
@@ -10588,9 +10662,19 @@ def merge_session_messages_append_only(
         if matched_visible_key is not None:
             skipped_count = skipped_state_visible_counts.get(matched_visible_key, 0)
             sidecar_count = sidecar_visible_counts.get(matched_visible_key, 0)
-            if skipped_count < sidecar_count:
+            if (
+                skipped_count < sidecar_count
+                # #7587: only spend the budget on an occurrence the ordered
+                # replay still owns; otherwise this is a genuine repeat.
+                and _sidecar_occurrence_still_owned(matched_visible_key, state_replay_idx)
+            ):
                 skipped_state_visible_counts[matched_visible_key] = skipped_count + 1
-                _merge_session_display_metadata(merged_by_visible_key.get(matched_visible_key), msg)
+                consumed = merged_by_visible_key.get(matched_visible_key)
+                _merge_session_display_metadata(consumed, msg)
+                # #7587: keep the ordered-replay cursor aligned here too.
+                state_replay_idx = _replay_cursor_after_consuming(
+                    consumed, state_replay_idx
+                )
                 continue
         # State rows at or before the newest sidecar timestamp are normally
         # assumed to have already been observed by the sidecar. The <= gate

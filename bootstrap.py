@@ -249,8 +249,29 @@ def discover_launcher_python(agent_dir: Path | None) -> str:
     return shutil.which("python3") or shutil.which("python") or sys.executable
 
 
+def _compat_probe_script() -> str:
+    """Return the source of the probe that checks a candidate interpreter.
+
+    Import order is load-bearing here (#7837). ``run_agent`` must be imported
+    BEFORE any WebUI-only dependency: importing it is what activates Hermes
+    Agent's managed dependency environment (``activate_dependencies()`` runs as
+    an import side effect), and when Hermes Agent decides the current
+    interpreter is not its managed one it re-execs via ``os.execv`` into an
+    isolated ``-I`` interpreter whose ``sys.path`` starts bare — the agent's own
+    root, no site-packages at all.
+
+    Probing ``yaml`` first therefore fails in that pre-activation state even
+    when the fully-activated environment genuinely provides PyYAML (it can
+    arrive transitively through Hermes Agent's own dependency graph). That made
+    this check reject *every* candidate interpreter after a Hermes Agent
+    interpreter bump, so the "reinstall the local venv and retry" loop could
+    never succeed and the WebUI crash-looped forever.
+    """
+    return "from run_agent import AIAgent\nimport yaml\n"
+
+
 def _python_can_run_webui_and_agent(python_exe: str, agent_dir: Path | None = None) -> bool:
-    script = "import yaml\nfrom run_agent import AIAgent\n"
+    script = _compat_probe_script()
     env = os.environ.copy()
     if agent_dir:
         # PREPEND agent_dir to PYTHONPATH so an `agent_dir/run_agent.py` wins

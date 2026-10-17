@@ -10,6 +10,16 @@ import threading
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# Restore this file's own directory onto sys.path (#7837). A plain
+# `python server.py` puts the script's directory on sys.path implicitly, but
+# when Hermes Agent's relaunch machinery re-invokes this file through
+# runpy.run_path() — which does NOT add the target script's directory — the
+# directory is missing and every `api.*` import below dies with
+# `ModuleNotFoundError: No module named 'api'`.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+
 def _ignore_sigpipe() -> None:
     """Keep broken client writes from terminating the server process."""
     if (sigpipe := getattr(signal, "SIGPIPE", None)) is not None:

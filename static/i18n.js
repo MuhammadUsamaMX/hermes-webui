@@ -768,6 +768,8 @@ const LOCALES = {
     settings_tab_preferences: 'Preferences',
     settings_tab_plugins: 'Plugins',
     settings_tab_extensions: 'Extensions',
+    settings_tab_messaging: 'Messaging',
+    settings_messaging_meta: 'Connect a messaging bot to this profile. Tokens are validated with Telegram before they are saved and are never shown again.',
     settings_extensions_gallery_tab: 'Gallery',
     settings_extensions_installed_tab: 'Installed',
     settings_extensions_diagnostics_tab: 'Diagnostics',

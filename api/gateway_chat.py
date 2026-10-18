@@ -648,6 +648,36 @@ def _gateway_stream_usage(payload: dict) -> dict:
     return out
 
 
+def _add_turn_usage_total(session: Any, attr: str, turn_value, coerce) -> bool:
+    """Add ONE turn's reported usage onto a session's cumulative total.
+
+    Every gateway request is served by a fresh agent, so its terminal usage
+    block reports only that request's counters - there is no cross-turn
+    running total on the wire to read. The session fields are billing
+    cumulatives by contract: static/messages.js derives each turn's badge by
+    SUBTRACTING the pre-turn session total (messages.js:6693-6705), and
+    api/state_sync.py:296 mirrors them into state.db as absolute totals.
+    Substituting the latest turn's value would bill only the final turn and
+    collapse every earlier turn's badge to zero.
+
+    Each field is coerced independently: a legacy string counter or type
+    mismatch in one persisted row must not cost the other counters their
+    turn, nor the transcript its persistence. Returns False when the value
+    was rejected rather than written.
+    """
+    prior = getattr(session, attr, None)
+    if isinstance(prior, bool) or not isinstance(prior, (int, float)) or not math.isfinite(prior):
+        prior = 0
+    try:
+        total = coerce(prior) + turn_value
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not math.isfinite(total):
+        return False
+    setattr(session, attr, total)
+    return True
+
+
 def _gateway_reasoning_delta(payload: dict) -> str:
     if not isinstance(payload, dict):
         return ""
@@ -3291,25 +3321,41 @@ def _run_gateway_chat_streaming(
             )
             # Gateway turns build no in-process agent/compressor, so nothing else
             # here ever wrote usage - it persisted 0 for every session. The
-            # terminal SSE chunk carries the turn's usage; the agent is fresh
-            # per request, so prompt_tokens is the full context for THIS turn,
-            # not a delta. Per-turn overwrite (#1857): replace the session's
-            # stored totals with the latest values from the wire, matching the
-            # local streaming path (api/streaming.py:12164-12173). Adding
-            # across turns (the old `s.field += delta`) would inflate the
-            # context ring numerator and trigger false compression warnings.
+            # terminal SSE chunk carries THIS turn's usage.
             #
-            # Best-effort: wrap all metadata mutation so a legacy string
-            # counter or type mismatch in a persisted session row can never
-            # prevent transcript persistence. Usage is a nicety; the
-            # transcript is the product.
+            # Producer scope decides add-vs-replace, and the gateway path is NOT
+            # the local streaming path: the local agent lives for the whole
+            # session and reports CUMULATIVE counters
+            # (api/streaming.py:15155-15184), so replace is correct there. A
+            # gateway request builds a FRESH agent and its usage block reports
+            # only that request's tokens - there is no cross-turn running total
+            # on the wire to read, so each turn's value is ADDED onto the
+            # session's cumulative billing total.
+            #
+            # This is what the consumers require. static/messages.js:6693-6705
+            # derives every turn's badge by subtracting the PRE-turn session
+            # total from the new one, and api/state_sync.py:296 mirrors these
+            # into state.db as absolute totals - both presuppose a cumulative.
+            # Replacing instead bills only the final turn and collapses every
+            # earlier turn's badge to zero.
+            #
+            # This does NOT inflate the context ring: the ring numerator is
+            # s.last_prompt_tokens, a separate field written only from the
+            # wire's own last_prompt_tokens key below. Conflating the billing
+            # total with the numerator is what produced the earlier rationale
+            # for overwriting.
+            #
+            # Best-effort: each field is coerced independently so a legacy
+            # string counter or type mismatch in a persisted session row can
+            # never cost the other counters their turn, nor prevent transcript
+            # persistence. Usage is a nicety; the transcript is the product.
             try:
                 _it = usage.get("input_tokens") or 0
                 if isinstance(_it, (int, float)) and _it > 0:
-                    s.input_tokens = int(_it)
+                    _add_turn_usage_total(s, "input_tokens", int(_it), int)
                 _ot = usage.get("output_tokens") or 0
                 if isinstance(_ot, (int, float)) and _ot > 0:
-                    s.output_tokens = int(_ot)
+                    _add_turn_usage_total(s, "output_tokens", int(_ot), int)
                 _ec = usage.get("estimated_cost")
                 if (
                     isinstance(_ec, (int, float))
@@ -3317,18 +3363,20 @@ def _run_gateway_chat_streaming(
                     and math.isfinite(_ec)
                     and _ec >= 0
                 ):
-                    s.estimated_cost = _ec
+                    # Additive, so an absent/zero cost no longer zeroes a real
+                    # running total the way the previous assignment did.
+                    _add_turn_usage_total(s, "estimated_cost", float(_ec), float)
                 _cr = usage.get("cache_read_tokens") or 0
                 if isinstance(_cr, (int, float)) and _cr > 0:
-                    s.cache_read_tokens = int(_cr)
+                    _add_turn_usage_total(s, "cache_read_tokens", int(_cr), int)
                 _cw = usage.get("cache_write_tokens") or 0
                 if isinstance(_cw, (int, float)) and _cw > 0:
-                    s.cache_write_tokens = int(_cw)
+                    _add_turn_usage_total(s, "cache_write_tokens", int(_cw), int)
             except Exception:
                 logger.debug("Usage persistence failed for session %s", session_id, exc_info=True)
-            # Report the session's current totals (overwritten above), which
-            # the browser uses for per-turn badges (messages.js subtracts the
-            # pre-turn session total from these values).
+            # Report the session's current cumulative totals (accumulated
+            # above), which the browser uses for per-turn badges (messages.js
+            # subtracts the pre-turn session total from these values).
             for _uk in (
                 "input_tokens", "output_tokens", "estimated_cost",
                 "cache_read_tokens", "cache_write_tokens",

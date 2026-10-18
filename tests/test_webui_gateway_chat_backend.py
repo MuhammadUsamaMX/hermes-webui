@@ -2259,10 +2259,12 @@ def test_gateway_absent_last_prompt_tokens_never_inherits_the_billing_total(tmp_
     optional events (defect #3). The fix removes the guess entirely - absent
     means untouched, full stop.
 
-    Usage fields now use per-turn overwrite semantics (#1857): the gateway's
-    terminal prompt_tokens is the full context for THIS turn, not a delta,
-    so adding across turns inflated the context ring numerator. After the fix,
-    s.input_tokens reflects the latest turn's prompt size.
+    s.input_tokens is the BILLING TOTAL and accumulates across turns: each
+    gateway request reports only its own turn's prompt_tokens, so the session
+    stores the running sum. This is not in tension with the context-ring
+    numerator above - that is s.last_prompt_tokens, a different field
+    (#1436). It is also what static/messages.js:6693-6705 requires, since it
+    derives each turn's badge by SUBTRACTING the pre-turn session total.
     """
     session_dir = tmp_path / "sessions"
     session_dir.mkdir()
@@ -2273,30 +2275,37 @@ def test_gateway_absent_last_prompt_tokens_never_inherits_the_billing_total(tmp_
     s = new_session()
     # No last_prompt_tokens on the wire at all: an older gateway.
     _run_gateway_turn(tmp_path, monkeypatch, s, '{"prompt_tokens":1000,"completion_tokens":10}')
-    saved = models.get_session(s.session_id)
+    saved = models.Session.load(s.session_id)
     assert saved.last_prompt_tokens is None, "no wire signal means no numerator, not a guess"
-    assert saved.input_tokens == 1000, "per-turn overwrite: latest prompt_tokens"
+    assert saved.input_tokens == 1000, "first turn's billing total"
 
-    _run_gateway_turn(tmp_path, monkeypatch, saved, '{"prompt_tokens":1200,"completion_tokens":10}')
-    saved = models.get_session(s.session_id)
-    assert saved.input_tokens == 1200, (
-        "overwrite with latest turn's prompt_tokens, not accumulate (2200 would "
-        "inflate the context ring and trigger false compression warnings)"
+    _run_gateway_turn(
+        tmp_path, monkeypatch, models.get_session(s.session_id),
+        '{"prompt_tokens":1200,"completion_tokens":10}',
+    )
+    # Assert from a COLD Session.load(), never get_session(): the assertions are
+    # about what reached the sidecar, not about the in-memory object. (Drive
+    # the turn itself with the resolved session - the worker re-resolves via
+    # get_session() and bails out of the writeback on a foreign instance.)
+    saved = models.Session.load(s.session_id)
+    assert saved.input_tokens == 2200, (
+        "billing total must accumulate across turns (1000 + 1200); overwriting "
+        "would discard turn 1 and make messages.js derive a negative per-turn badge"
     )
     assert saved.last_prompt_tokens is None, (
-        "must never silently become the 1200 prompt size just because two "
-        "tool-free-looking turns went by"
+        "must never silently become the cumulative billing total just because "
+        "two tool-free-looking turns went by"
     )
 
 
 def test_gateway_persists_the_cache_token_split_across_turns(tmp_path, monkeypatch):
     """cache_read/cache_write are parsed, so they must also be persisted.
 
-    static/messages.js:6055/6134 derives the per-turn cache badge by
+    static/messages.js:6693-6705 derives the per-turn cache badge by
     subtracting the pre-turn session totals, exactly as it does for
-    input/output. Per-turn overwrite (#1857): the gateway's terminal
-    cache_read_tokens is the cache reads for THIS turn, not a cumulative
-    total, so the session stores the latest turn's value.
+    input/output. Each gateway request reports only THIS turn's cache
+    reads/writes, so the session totals accumulate: two identical turns
+    must persist 2x, not 1x.
     """
     session_dir = tmp_path / "sessions"
     session_dir.mkdir()
@@ -2309,9 +2318,51 @@ def test_gateway_persists_the_cache_token_split_across_turns(tmp_path, monkeypat
     _run_gateway_turn(tmp_path, monkeypatch, s, usage)
     _run_gateway_turn(tmp_path, monkeypatch, models.get_session(s.session_id), usage)
 
-    saved = models.get_session(s.session_id)
-    assert saved.cache_read_tokens == 300, "overwrite with latest turn's cache reads"
-    assert saved.cache_write_tokens == 40, "overwrite with latest turn's cache writes"
+    saved = models.Session.load(s.session_id)
+    assert saved.cache_read_tokens == 600, "two turns of 300 cache reads accumulate"
+    assert saved.cache_write_tokens == 80, "two turns of 40 cache writes accumulate"
+
+
+def test_gateway_billing_totals_accumulate_across_turns_and_survive_cold_reload(tmp_path, monkeypatch):
+    """Two gateway turns must persist the SUM of both turns' usage, and that
+    sum must survive a cold reload from disk.
+
+    The gateway agent is created fresh per request, so each terminal usage
+    block reports only THAT turn's counters - there is no cross-turn running
+    total to read, and overwriting therefore bills only the last turn.
+    static/messages.js:6693-6705 depends on the opposite: it derives each
+    turn's badge by SUBTRACTING the pre-turn session total from the new one,
+    so a non-cumulative total yields a wrong (here: negative, clamped to 0)
+    per-turn delta on every turn after the first.
+
+    Covers all five billing counters in one pass, since each is reported per
+    request and each is consumed as a session cumulative: input, output,
+    cache read, cache write and cost.
+    """
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+
+    s = new_session()
+    _run_gateway_turn(
+        tmp_path, monkeypatch, s,
+        '{"prompt_tokens":1000,"completion_tokens":100,'
+        '"cache_read_tokens":700,"cache_write_tokens":200,"estimated_cost":0.5}',
+    )
+    _run_gateway_turn(
+        tmp_path, monkeypatch, models.get_session(s.session_id),
+        '{"prompt_tokens":1200,"completion_tokens":150,'
+        '"cache_read_tokens":300,"cache_write_tokens":50,"estimated_cost":0.25}',
+    )
+
+    saved = models.Session.load(s.session_id)
+    assert saved.input_tokens == 2200, "1000 + 1200: both turns billed"
+    assert saved.output_tokens == 250, "100 + 150"
+    assert saved.cache_read_tokens == 1000, "700 + 300"
+    assert saved.cache_write_tokens == 250, "200 + 50"
+    assert saved.estimated_cost == pytest.approx(0.75), "0.5 + 0.25"
 
 
 def test_gateway_provider_prefix_strip_keeps_colon_tagged_and_host_port_models(tmp_path, monkeypatch):

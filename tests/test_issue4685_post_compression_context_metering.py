@@ -182,7 +182,10 @@ def test_context_indicator_without_estimate_preserves_current_behavior():
 
 def test_reload_hydration_passes_post_compression_estimate_to_context_indicator():
     expected = "post_compression_context_tokens_estimate"
-    for path, expected_calls in ((ROOT / "static" / "boot.js", 1), (ROOT / "static" / "sessions.js", 3)):
+    # #7732 routed the third sessions.js call site through the shared
+    # _projectCtxUsageForDisplay() helper, so only two inline object call sites
+    # remain there. The helper carries the estimate for that third site.
+    for path, expected_calls in ((ROOT / "static" / "boot.js", 1), (ROOT / "static" / "sessions.js", 2)):
         source = path.read_text(encoding="utf-8")
         calls = source.split("_syncCtxIndicator({")[1:]
 

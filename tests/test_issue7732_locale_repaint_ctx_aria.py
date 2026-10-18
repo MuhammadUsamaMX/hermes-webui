@@ -136,6 +136,11 @@ eval(extractBlock(ui, 'function _fmtTokens('));
 var _MOBILE_CONFIG_BASE_LABEL = global._MOBILE_CONFIG_BASE_LABEL;
 eval(extractBlock(ui, 'function _setCtxCompressButton('));
 eval(extractBlock(ui, 'function _syncMobileCtxDisplay('));
+// #7732: the shared projection the repaint now delegates to. Extracted
+// best-effort so that a build WITHOUT the helper still runs the driver and
+// exercises the legacy fallback path — that is what keeps these regressions
+// discriminating rather than erroring out on a missing marker.
+try { eval(extractBlock(ui, 'function _projectCtxUsageForDisplay(')); } catch (e) {}
 eval(extractBlock(ui, 'function _syncCtxIndicator('));
 
 // 1) Establish the dynamic names the way a live usage update does.
@@ -151,10 +156,18 @@ applyLocaleToDOM();
 const afterDesktop = ctxIndicator.getAttribute('aria-label');
 const afterMobile  = mobileCtx.getAttribute('aria-label');
 
+// The auto-compress threshold line is the only surface that distinguishes an
+// explicit threshold of 0 (line hidden) from a stale positive one (line shown),
+// so the driver reports it directly.
+const thresholdLine = byId.ctxTooltipThreshold;
+const afterThresholdDisplay = thresholdLine ? thresholdLine.style.display : null;
+const afterThresholdText = thresholdLine ? thresholdLine.textContent : null;
+
 process.stdout.write(JSON.stringify({
   lang,
   beforeDesktop, afterDesktop,
   beforeMobile, afterMobile,
+  afterThresholdDisplay, afterThresholdText,
 }));
 """
 
@@ -222,3 +235,54 @@ def test_repaint_uses_current_session_context_limit(driver_path):
     assert "42%" not in out["afterDesktop"], out
     assert "9%" in out["afterDesktop"], out
     assert "9%" in out["afterMobile"], out
+
+
+def test_repaint_cold_load_projects_persisted_session_fields(driver_path):
+    # Finding 1 — cold load. `Session.compact()` (api/models.py) returns
+    # INDIVIDUAL usage fields and never a `last_usage` object, so
+    # `static/sessions.js` assigns S.lastUsage = {} on a cold load. The repaint
+    # must project those persisted per-field values instead of repainting from
+    # an empty usage object and blanking the indicator.
+    session = {
+        "input_tokens": 60000,
+        "output_tokens": 2000,
+        "estimated_cost": 0.0234,
+        "last_prompt_tokens": 53760,
+        "context_length": 128000,
+    }
+    out = _repaint(driver_path, "ja", usage={}, session=session)
+    assert "42%" in out["afterDesktop"], out
+    assert "$" in out["afterDesktop"], out
+    assert "42%" in out["afterMobile"], out
+
+
+def test_repaint_keeps_newer_metering_over_stale_session_compression_estimate(driver_path):
+    # Finding 3 — freshness. The metering listener (static/messages.js) writes
+    # the newest post_compression_context_tokens_estimate into S.lastUsage and
+    # never touches S.session, so any stored session copy is STALE. The repaint
+    # must not let it clobber the fresher live value.
+    usage = {
+        "last_prompt_tokens": 53760,
+        "context_length": 128000,
+        "post_compression_context_tokens_estimate": 60000,
+    }
+    session = {"post_compression_context_tokens_estimate": 30000}
+    out = _repaint(driver_path, "ja", usage=usage, session=session)
+    assert "47%" in out["afterDesktop"], out      # 60000 / 128000
+    assert "23%" not in out["afterDesktop"], out  # 30000 / 128000 is the stale one
+    assert "47%" in out["afterMobile"], out
+
+
+def test_repaint_honours_explicit_zero_threshold_over_stale_positive(driver_path):
+    # Finding 2 — an authoritative threshold of 0 (auto-compress disabled) is a
+    # real value, semantically distinct from an absent one. The repaint must
+    # apply it instead of leaving the stale positive S.lastUsage threshold up.
+    usage = {
+        "last_prompt_tokens": 53760,
+        "context_length": 128000,
+        "threshold_tokens": 60000,
+    }
+    session = {"threshold_tokens": 0}
+    out = _repaint(driver_path, "ja", usage=usage, session=session)
+    assert out["afterThresholdDisplay"] == "none", out
+    assert not out["afterThresholdText"], out

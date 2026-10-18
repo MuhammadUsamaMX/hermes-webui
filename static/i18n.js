@@ -29138,21 +29138,23 @@ function applyLocaleToDOM() {
   // The static stamp just overwrote those with the bare label. Recompute them
   // from the authoritative current usage so a locale repaint (settings change
   // or global repaint) never drops the percentage/cost/no-prompt metrics.
+  //
+  // Use the SAME shared projection the normal display path uses rather than
+  // re-deriving it here: an inline copy diverged from static/sessions.js on
+  // cold loads (Session.compact() persists individual fields, never a
+  // `last_usage` object, so S.lastUsage is {} there), conflated an explicit
+  // threshold of 0 with an absent one, and let a stale session copy of the
+  // post-compression estimate clobber a newer metering value.
   if (typeof _syncCtxIndicator === 'function') {
     try {
-      const usage = Object.assign({}, (typeof S !== 'undefined' && S.lastUsage) || {});
-      const sess = (typeof S !== 'undefined' && S.session) || {};
-      // A model switch refreshes S.session.context_length (and its threshold /
-      // compression estimate) without touching S.lastUsage, so repainting from
-      // the raw usage object would redraw the previous model's window. The
-      // session copy is what the live path (_resolveSessionModelForDisplaySoon)
-      // already treats as authoritative.
-      if (Number(sess.context_length) > 0) usage.context_length = sess.context_length;
-      if (Number(sess.threshold_tokens) > 0) usage.threshold_tokens = sess.threshold_tokens;
-      if (sess.post_compression_context_tokens_estimate != null) {
-        usage.post_compression_context_tokens_estimate = sess.post_compression_context_tokens_estimate;
-      }
-      _syncCtxIndicator(usage);
+      const _hasProject = typeof _projectCtxUsageForDisplay === 'function';
+      const _usage = _hasProject
+        ? _projectCtxUsageForDisplay(
+            (typeof S !== 'undefined' && S.lastUsage) || {},
+            (typeof S !== 'undefined' && S.session) || {},
+          )
+        : Object.assign({}, (typeof S !== 'undefined' && S.lastUsage) || {});
+      _syncCtxIndicator(_usage);
     } catch (e) { /* dynamic repaint is best-effort; never block locale */ }
   }
   if (typeof syncWorkspacePanelUI === 'function') syncWorkspacePanelUI();

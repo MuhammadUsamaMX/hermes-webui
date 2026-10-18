@@ -3507,24 +3507,20 @@ async function loadSession(sid){
     }
   }
 
-  // Sync context usage indicator from session data
+  // Sync context usage indicator from session data.
+  // #7732: route through the shared projection so the normal display path and
+  // the locale repaint agree on freshness (cold-load fields, explicit-zero
+  // threshold, stale post-compression estimate) instead of each open-coding it.
   const _s=S.session;
   if(_s&&typeof _syncCtxIndicator==='function'){
-    const u=S.lastUsage||{};
-    const _pick=(latest,stored,dflt=0)=>latest!=null?latest:(stored!=null?stored:dflt);
-    const _pickPositive=(latest,stored,dflt=0)=>Number(latest)>0?latest:(Number(stored)>0?stored:dflt);
-    _syncCtxIndicator({
-      input_tokens:      _pick(u.input_tokens,      _s.input_tokens),
-      output_tokens:     _pick(u.output_tokens,     _s.output_tokens),
-      estimated_cost:    _pick(u.estimated_cost,    _s.estimated_cost),
-      cache_read_tokens: _pick(u.cache_read_tokens, _s.cache_read_tokens),
-      cache_write_tokens:_pick(u.cache_write_tokens,_s.cache_write_tokens),
-      cache_hit_percent: _pick(u.cache_hit_percent, _s.cache_hit_percent, null),
-      context_length:    _pickPositive(u.context_length, _s.context_length),
-      last_prompt_tokens:_pick(u.last_prompt_tokens,_s.last_prompt_tokens),
-      post_compression_context_tokens_estimate:_s.post_compression_context_tokens_estimate||null,
-      threshold_tokens:  _pick(_s.threshold_tokens,  u.threshold_tokens),
-    });
+    // No inline fallback: a second hand-rolled projection here is exactly the
+    // divergence #7732 exists to remove. ui.js always loads before sessions.js
+    // (static/index.html), so the helper is present; the guard only keeps a
+    // load-order surprise from throwing inside loadSession(). Deliberately a
+    // nested `if`, not an early return — the rest of loadSession() must still run.
+    if(typeof _projectCtxUsageForDisplay==='function'){
+      _syncCtxIndicator(_projectCtxUsageForDisplay(S.lastUsage||{},_s));
+    }
   }
   if(typeof _renderPendingPromptsForActiveSession==='function') _renderPendingPromptsForActiveSession();
 

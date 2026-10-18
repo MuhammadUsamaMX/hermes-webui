@@ -239,11 +239,13 @@ def _constant_time_equals(a: str, b: str) -> bool:
 
 def _explicitly_disabled(profile_home: Path, platform_id: str) -> bool:
     """Honour an explicit ``platforms.<id>.enabled: false`` in config.yaml."""
-    import yaml
+    # PyYAML is not guaranteed in the managed runtime (ruamel-only); the
+    # compat shim provides safe_load either way. #yaml-ruamel-fallback
+    from api import yaml_compat as _yaml
 
     config_path = Path(profile_home) / "config.yaml"
     try:
-        payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        payload = _yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     except Exception:
         return False
     if not isinstance(payload, dict):

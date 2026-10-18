@@ -177,6 +177,69 @@ def test_aider_blank_history_parses_promptly(tmp_path):
     assert elapsed < 5.0, f"blank history parse took {elapsed:.2f}s"
 
 
+def test_aider_blank_trim_is_linear_not_quadratic():
+    """The blank-trim must not shift the list once per padding line.
+
+    The wall-clock assertion above is only a smoke test: restoring the old
+    ``lines.pop(0)`` loop still passes it on a fast runner, because CPython's
+    list shift is a fast memmove. This is the control that actually
+    discriminates the regression, and it is machine-speed independent.
+
+    It counts list mutations. Index-based trimming never calls ``pop``; the
+    quadratic version called it once per leading padding line, so a 200k-line
+    flood drives the count to 200_000 instead of 0. Any future reintroduction
+    of a shifting trim -- not just that exact loop -- fails here.
+    """
+    import api.models as models
+
+    class _CountingList(list):
+        """A list that records every in-place removal."""
+
+        def __init__(self, items):
+            super().__init__(items)
+            self.pops = 0
+
+        def pop(self, index=-1):
+            self.pops += 1
+            return super().pop(index)
+
+    blank = ["  " for _ in range(200_000)]
+    counted = _CountingList(blank)
+    assert models._join_aider_lines(counted) == ""
+
+    # Linear trimming removes nothing: it walks indices inward and slices.
+    assert counted.pops == 0, (
+        f"blank trim shifted the list {counted.pops} time(s) -- O(n^2) on a "
+        "padding flood; use index-based trimming instead of pop(0)"
+    )
+
+
+def test_aider_blank_trim_keeps_the_real_turn_and_drops_only_padding():
+    """The linear trim must not change WHICH lines survive, only how.
+
+    Only the leading and trailing padding-only lines are dropped. An interior
+    blank line is real transcript structure -- it separates paragraphs of one
+    assistant turn -- and must survive; that is also what separates the two
+    shapes, so this pins the difference rather than just the fast path.
+    """
+    import api.models as models
+
+    # Leading/trailing padding goes; the interior blank is kept as a paragraph
+    # break between the two lines of one turn.
+    lines = ["  ", "  ", "the real answer  ", "  ", "continued  ", "  "]
+    assert models._join_aider_lines(list(lines)) == "the real answer\n\ncontinued"
+    # Only TRAILING whitespace is normalized. aider's linebreak=True appends
+    # "  \n", so trailing padding is the noise; leading indentation is real
+    # markdown and must survive.
+    assert models._join_aider_lines(["  first  ", "second  "]) == "  first\nsecond"
+    assert models._join_aider_lines(["  ", "  "]) == ""
+    assert models._join_aider_lines([]) == ""
+    # Same leading-indent rule for a single-line block.
+    assert models._join_aider_lines(["  only content  "]) == "  only content"
+    # Only TRAILING whitespace on a content line is ever removed.
+    assert models._join_aider_lines(["content   "]) == "content"
+
+
 def test_aider_scan_skips_symlinks_oversized_files_and_missing_root(tmp_path):
     import api.models as models
 

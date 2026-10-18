@@ -9337,6 +9337,57 @@ function _syncMobileCtxDisplay(state){
   _setCtxCompressButton(compressBtn,state.compressText||'');
 }
 
+// #7732: the ONE authoritative projection of "live metering + persisted
+// session metadata" onto the shape `_syncCtxIndicator()` consumes.
+//
+// `latest` is S.lastUsage (live metering, newest) and `session` is S.session
+// (the persisted per-field values from Session.compact()). Both must be
+// honoured: compact() returns INDIVIDUAL fields and never a `last_usage`
+// object, so on a cold load S.lastUsage is {} and the persisted numbers are
+// the only source of truth. Freshness has to be judged PER FIELD, because the
+// two writers update disjoint sets:
+//   * a model switch refreshes S.session.context_length / threshold_tokens
+//     without touching S.lastUsage (static/sessions.js), and
+//   * the metering listener refreshes S.lastUsage.
+//     post_compression_context_tokens_estimate without touching S.session
+//     (static/messages.js).
+// Callers that previously open-coded this projection diverge from each other;
+// route every `_syncCtxIndicator()` caller through here instead of adding
+// another inline variant.
+function _projectCtxUsageForDisplay(latest, session){
+  const u=(latest&&typeof latest==='object')?latest:{};
+  const s=(session&&typeof session==='object')?session:{};
+  // Token / cost / cache counters: the live metering value wins when present,
+  // otherwise fall back to the persisted session field (the cold-load case).
+  const _pick=(live,stored,dflt=0)=>live!=null?live:(stored!=null?stored:dflt);
+  const projected={
+    input_tokens:_pick(u.input_tokens,s.input_tokens),
+    output_tokens:_pick(u.output_tokens,s.output_tokens),
+    estimated_cost:_pick(u.estimated_cost,s.estimated_cost),
+    cache_read_tokens:_pick(u.cache_read_tokens,s.cache_read_tokens),
+    cache_write_tokens:_pick(u.cache_write_tokens,s.cache_write_tokens),
+    cache_hit_percent:_pick(u.cache_hit_percent,s.cache_hit_percent,null),
+    last_prompt_tokens:_pick(u.last_prompt_tokens,s.last_prompt_tokens),
+  };
+  // A positive session window is the newer one (model switch); otherwise keep
+  // the live window, and fall back to 0 rather than a magic default so the
+  // indicator's own DEFAULT_CTX still applies.
+  projected.context_length=Number(s.context_length)>0?s.context_length
+    :(Number(u.context_length)>0?u.context_length:0);
+  // An explicit threshold of 0 (auto-compress disabled) is a real value and is
+  // semantically distinct from an absent one, so this tests != null — never
+  // truthiness, which would silently resurrect a stale positive threshold.
+  projected.threshold_tokens=s.threshold_tokens!=null?s.threshold_tokens
+    :(u.threshold_tokens!=null?u.threshold_tokens:0);
+  // The metering listener writes the newest post-compression estimate into
+  // S.lastUsage and never touches S.session, so the live value wins; the stored
+  // one only fills in before the first metering update of the session.
+  projected.post_compression_context_tokens_estimate=
+    u.post_compression_context_tokens_estimate!=null?u.post_compression_context_tokens_estimate
+    :(s.post_compression_context_tokens_estimate!=null?s.post_compression_context_tokens_estimate:null);
+  return projected;
+}
+
 function _mergeUsageForCtxIndicator(latest, fallback){
   const latestObj=(latest&&typeof latest==='object')?latest:{};
   const fallbackObj=(fallback&&typeof fallback==='object')?fallback:{};

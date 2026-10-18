@@ -9693,6 +9693,33 @@ def _is_aider_session_id(sid: str) -> bool:
     return str(sid or "").startswith(f"{AIDER_SOURCE}_")
 
 
+def _is_claude_code_session_id(sid: str) -> bool:
+    """Return True when ``sid`` is a Claude Code external-agent import id.
+
+    Same reasoning as the Aider prefix above, and the same shipped intent:
+    ``get_claude_code_sessions()`` already stamps ``read_only: True`` on every
+    row it builds (api/models.py), because the transcript is read straight out
+    of ``~/.claude/projects`` and the WebUI does not own it. That flag lives in
+    the list metadata, though, so it is only as strong as the lookup that
+    produced it -- and a metadata MISS (all-profiles resolve, evicted cache,
+    another profile's binding) would otherwise drop through to
+    ``import_cli_session`` and mint a writable sidecar for a conversation that
+    is still live in Claude Code.
+    """
+    return str(sid or "").startswith(f"{CLAUDE_CODE_SOURCE}_")
+
+
+def _is_external_read_only_session_id(sid: str) -> bool:
+    """Return True for an id that is external read-only by PREFIX.
+
+    The prefix is the authority precisely because it cannot be laundered by a
+    metadata lookup that misses. Every id whose source stamps ``read_only: True``
+    belongs here; an id that does not (ordinary CLI/messaging/cron sessions) is
+    untouched, so ordinary profile-ownership checks are not weakened.
+    """
+    return _is_aider_session_id(sid) or _is_claude_code_session_id(sid)
+
+
 def _session_is_subagent_view_only(sid: str) -> bool:
     """Return True when ``sid`` is a delegated subagent child by ANY signal —
     state.db source OR a persisted WebUI sidecar tagged subagent.
@@ -33431,7 +33458,7 @@ def _handle_session_import_cli(handler, body):
             # external Aider conversation back into a writable session either.
             # Without the coercion below, a stale writable sidecar imported
             # before the read-only gate survives a refresh unchanged.
-            if _is_aider_session_id(sid) and not getattr(existing, "read_only", False):
+            if _is_external_read_only_session_id(sid) and not getattr(existing, "read_only", False):
                 existing.read_only = True
                 changed = True
         if changed:
@@ -33503,13 +33530,16 @@ def _handle_session_import_cli(handler, body):
     # can miss it (#5307 cross-profile edge).
     _cli_sa = (cli_source_tag or cli_raw_source or "").strip().lower() == "subagent"
     _sa_child = _sa_child or _cli_sa
-    # #674: an Aider id is an EXTERNAL read-only conversation. Aider list
-    # metadata carries ``profile: None``, so an all-profiles resolve can miss
-    # and return {} while the profile-aware message lookup still succeeds --
-    # which previously let a real CLI import run and mint a
-    # writable sidecar. The id prefix is the read-only identity (#674).
-    _aider_ro = _is_aider_session_id(sid)
-    _read_only_view = cli_read_only or _sa_child or _aider_ro
+    # #674: an external-agent id is read-only BY PREFIX. Both bridges stamp
+    # ``read_only: True`` on every list row they build (get_aider_sessions /
+    # get_claude_code_sessions in api/models.py), so this is the shipped intent
+    # restated where it cannot be laundered: Aider list metadata carries
+    # ``profile: None``, so an all-profiles resolve can miss and return {} while
+    # the profile-aware message lookup still succeeds -- which previously let a
+    # real CLI import run and mint a writable sidecar for a conversation that is
+    # still live in the other agent. Claude Code misses the same way.
+    _external_ro = _is_external_read_only_session_id(sid)
+    _read_only_view = cli_read_only or _sa_child or _external_ro
 
     # Use the CLI session title if available (e.g., cron job name), otherwise derive from messages
     title = cli_title or title_from(msgs, "CLI Session")

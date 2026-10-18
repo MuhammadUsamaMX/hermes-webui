@@ -374,6 +374,103 @@ def test_metadata_miss_refresh_never_mints_a_writable_sidecar(import_boundary):
     assert response['session']['read_only'] is True
 
 
+def test_all_profiles_import_of_claude_code_session_is_read_only_on_metadata_miss(
+    import_boundary,
+):
+    """A Claude Code id must never become a WRITABLE WebUI session, either.
+
+    ``get_claude_code_sessions()`` stamps ``read_only: True`` on every row it
+    builds (api/models.py) -- the shipped intent is already read-only, because
+    the transcript is read straight out of ``~/.claude/projects`` and the WebUI
+    does not own it. That flag, however, travels in the list metadata, and that
+    metadata carries ``profile: None`` for both external bridges. So an
+    all-profiles resolve returns ``{}`` while the profile-aware message lookup
+    still succeeds, and the handler used to reach the real
+    ``import_cli_session`` and mint a writable sidecar. Keying the read-only
+    rule on the external id PREFIX closes it without relying on a lookup that
+    can miss.
+    """
+    routes = import_boundary['routes']
+    sid = 'claude_code_deadbeefcafe0001'
+
+    # The id needs a resolvable transcript, otherwise the handler 404s in
+    # get_cli_session_messages and never reaches the read-only decision this
+    # test is about. Serve messages for it exactly like the ordinary-CLI
+    # over-reach guard below does.
+    messages = [
+        {'role': 'user', 'content': 'hello from claude code'},
+        {'role': 'assistant', 'content': 'hi'},
+    ]
+
+    import api.routes as routes_mod
+
+    original = routes_mod.get_cli_session_messages
+    routes_mod.get_cli_session_messages = lambda _sid, profile=None: messages
+    try:
+        response = routes._handle_session_import_cli(
+            object(),
+            {'session_id': sid, 'profile': 'work', 'all_profiles': True},
+        )
+    finally:
+        routes_mod.get_cli_session_messages = original
+
+    assert response.get('imported') is False, (
+        'a metadata-missed Claude Code import must stay a read-only view, not '
+        f'a materialized writable session; got {response.get("imported")!r}'
+    )
+    assert response['session']['read_only'] is True, (
+        f'the response projection must be read_only; got {response["session"]!r}'
+    )
+
+    # The persisted-session boundary: no writable sidecar on disk.
+    sidecar = import_boundary['dir'] / f'{sid}.json'
+    if sidecar.exists():
+        persisted = json.loads(sidecar.read_text(encoding='utf-8'))
+        assert persisted.get('read_only') is True, (
+            'reloading the saved sidecar must still show read_only; got '
+            f'{persisted.get("read_only")!r}'
+        )
+
+
+def test_metadata_miss_refresh_coerces_claude_code_to_read_only(import_boundary):
+    """The REFRESH path must coerce a Claude Code sidecar, not just Aider's.
+
+    A stale writable sidecar written before the read-only gate must not
+    survive a refresh. This is the second laundering path the maintainer named,
+    and it is the one a fresh-import test cannot reach.
+    """
+    routes = import_boundary['routes']
+    models = import_boundary['models']
+    sid = 'claude_code_feedface00000002'
+
+    stale = models.Session(
+        session_id=sid,
+        title='stale',
+        workspace=str(import_boundary['root']),
+        model='claude',
+        messages=[{'role': 'user', 'content': 'hello from claude code'}],
+        profile='work',
+    )
+    stale.save(touch_updated_at=False)
+
+    assert models.Session.load(sid) is not None
+    assert models.Session.load(sid).read_only is False, (
+        'precondition: the stale sidecar must start WRITABLE, otherwise this '
+        'test cannot prove the refresh coerced it'
+    )
+
+    routes._handle_session_import_cli(
+        object(),
+        {'session_id': sid, 'profile': 'work', 'all_profiles': True},
+    )
+
+    reloaded = models.Session.load(sid)
+    assert reloaded is not None and reloaded.read_only is True, (
+        'a Claude Code refresh on a metadata miss must coerce read_only; got '
+        f'{getattr(reloaded, "read_only", None)!r}'
+    )
+
+
 def test_ordinary_cli_import_is_not_downgraded_by_the_read_only_rule(import_boundary):
     """The read-only rule must key on the EXTERNAL id prefix only.
 

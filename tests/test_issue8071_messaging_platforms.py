@@ -105,7 +105,7 @@ def _call_put(monkeypatch, path: str, body: dict):
 
 def test_list_reports_configured_state_without_reading_back_the_token(monkeypatch, tmp_path):
     home = _seed_profile(tmp_path, "work", token=TOKEN_A, allowed="123")
-    messaging = _wire(monkeypatch, tmp_path, "work", {"work": home})
+    _wire(monkeypatch, tmp_path, "work", {"work": home})
 
     handler, payload = _call_get(monkeypatch, "/api/messaging/platforms")
 

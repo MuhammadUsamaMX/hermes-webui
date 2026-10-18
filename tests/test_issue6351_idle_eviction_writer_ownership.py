@@ -243,9 +243,29 @@ def test_draft_racing_an_idle_tick_does_not_roll_back_acknowledged_text(
 
     results: dict[str, tuple] = {}
     errors: dict[str, BaseException] = {}
+    # One response callback for BOTH threads, installed before either starts,
+    # storing by the handler it is passed. A per-thread `routes.j` would be
+    # replaced by whichever thread set it last: draft B installs its callback
+    # while A is paused at the save seam, so BOTH responses would land in B's
+    # slot and A's slot would stay empty — which the `.get("status", 200)`
+    # below would silently read as a 200 A never sent.
+    captured: dict[str, dict] = {}
+
+    def capture(_handler, payload, status=200, extra_headers=None):
+        name = _handler._capture_name
+        assert name in captured, (
+            f"routes.j fired for an unknown handler {name!r}; responses would "
+            f"not be attributable to the request that sent them"
+        )
+        captured[name].update(payload=payload, status=status)
+        return True
+
+    monkeypatch.setattr(routes, "read_body", lambda h: h.body)
+    monkeypatch.setattr(routes, "_check_csrf", lambda h: True)
+    monkeypatch.setattr(routes, "j", capture)
 
     def run_draft(name, body):
-        captured: dict = {}
+        captured.setdefault(name, {})
         handler = SimpleNamespace(
             command="POST",
             body=body,
@@ -254,19 +274,12 @@ def test_draft_racing_an_idle_tick_does_not_roll_back_acknowledged_text(
             send_header=lambda key, value: None,
             end_headers=lambda: None,
             _safe_webui_print=lambda msg: None,
-        )
-        monkeypatch.setattr(routes, "read_body", lambda h: h.body)
-        monkeypatch.setattr(routes, "_check_csrf", lambda h: True)
-        monkeypatch.setattr(
-            routes, "j",
-            lambda _h, payload, status=200, extra_headers=None: captured.update(
-                payload=payload, status=status
-            ) or True,
+            _capture_name=name,
         )
         try:
             results[name] = (
                 routes.handle_post(handler, SimpleNamespace(path="/api/session/draft")),
-                captured,
+                captured[name],
             )
         except BaseException as exc:  # surfaced by the assertions below
             errors[name] = exc
@@ -342,7 +355,14 @@ def test_draft_racing_an_idle_tick_does_not_roll_back_acknowledged_text(
     assert not errors, f"handler raised: {errors}"
     for name in ("A", "B"):
         assert results[name][0] is True, f"draft {name} did not complete the handler"
-        assert results[name][1].get("status", 200) == 200, (
+        # Require an EXPLICIT status. Defaulting to 200 here would treat a
+        # missing response as success and let one request's error hide behind
+        # the other's payload.
+        assert "status" in results[name][1], (
+            f"draft {name} produced no response at all: "
+            f"{results[name][1]!r} (a missing response must not read as 200)"
+        )
+        assert results[name][1]["status"] == 200, (
             f"draft {name} did not return 200: {results[name][1]}"
         )
 
@@ -465,4 +485,156 @@ def test_full_scan_fallback_survives_a_concurrent_idle_reaper_tick(isolated_sess
     ids = {s["session_id"] for s in sessions}
     assert "sess0000-tripwire" in ids, (
         "the full-scan fallback must still return the resident tripwire session"
+    )
+
+
+# ─────── audited metadata writers: resolve must happen under the write lock ──
+
+# Routes that resolve a session object, then take the per-session agent lock,
+# then mutate + s.save(). The hazard is the ORDER, not the fields: while the
+# resolved object is in hand but the lock is not yet held, the writer has no
+# writer-ownership protection, so an idle tick may evict the cache entry and the
+# writer persists a detached object. save() writes composer_draft and
+# enabled_toolsets in ONE sidecar write (api/models.py:2539-2540), so a stale
+# object silently rolls back acknowledged composer text too.
+_AUDITED_WRITERS = [
+    ("/api/session/toolsets", {"toolsets": ["shell"]}),
+    ("/api/personality/set", {"name": ""}),
+]
+
+
+@pytest.mark.parametrize("path,extra_body", _AUDITED_WRITERS)
+def test_metadata_writer_racing_an_idle_tick_keeps_its_resolved_object(
+    isolated_session_env, monkeypatch, path, extra_body
+):
+    """An audited metadata writer must resolve the session INSIDE its lock.
+
+    The schedule drives the REAL ``handle_post`` branch and the REAL
+    ``_reaper_loop`` tick:
+
+      1. writer A resolves the target through ``routes.get_session`` and
+         pauses exactly at that resolve, holding no agent lock yet;
+      2. one more clean entry puts the cache over cap;
+      3. one real idle tick runs;
+      4. the tick must NOT drop or replace the target, because A is mid-write
+         on it and the object it holds is the one it will persist through.
+
+    This is discriminating by construction. If the route resolves BEFORE
+    taking the lock (the shape being fixed), A is paused with the lock
+    unheld, the writer predicate reports "no live writer", and the tick evicts
+    the target — the assertion below fails. Once the route resolves INSIDE the
+    lock, the pause happens with the lock held, the predicate keeps the entry
+    resident, and it passes.
+    """
+    from api import background_process as bp
+    from api import config as _cfg
+    from api import models
+    from api import routes
+
+    _cfg.SESSIONS_MAX = 4
+    target = _make_persisted_session(7301)
+    target.composer_draft = {"text": "ORIGINAL TEXT", "files": []}
+    target.save()
+    _insert_without_eviction(target)
+    for i in (7302, 7303, 7304):
+        _insert_without_eviction(_make_persisted_session(i, pinned=True))
+
+    sid = target.session_id
+    real_get_session = routes.get_session
+    paused = threading.Event()
+    release = threading.Event()
+
+    def gated_get_session(sid_arg, *args, **kwargs):
+        sess = real_get_session(sid_arg, *args, **kwargs)
+        if threading.current_thread().name != "writer-A":
+            return sess
+        # Gate ONLY the writer's own resolve — the one taken while the
+        # per-session agent lock is HELD. Several read-only resolves happen
+        # first and legitimately run unlocked: the subagent-view-only guard
+        # (_session_is_subagent_view_only -> get_session) and the existence
+        # pre-check. Pausing at one of those would test nothing: they persist
+        # nothing, so a tick evicting the entry at that moment is harmless.
+        lock = _cfg.SESSION_AGENT_LOCKS.get(sid_arg)
+        if lock is None or not lock.locked():
+            return sess
+        paused.set()
+        assert release.wait(20), "test never released writer A"
+        return sess
+
+    monkeypatch.setattr(routes, "get_session", gated_get_session)
+
+    captured: dict = {}
+    errors: dict[str, BaseException] = {}
+
+    def capture(_handler, payload, status=200, extra_headers=None):
+        captured.update(payload=payload, status=status)
+        return True
+
+    monkeypatch.setattr(routes, "read_body", lambda h: h.body)
+    monkeypatch.setattr(routes, "_check_csrf", lambda h: True)
+    monkeypatch.setattr(routes, "j", capture)
+
+    def run_writer():
+        handler = SimpleNamespace(
+            command="POST",
+            body={"session_id": sid, **extra_body},
+            wfile=None,
+            send_response=lambda status: None,
+            send_header=lambda key, value: None,
+            end_headers=lambda: None,
+            _safe_webui_print=lambda msg: None,
+        )
+        try:
+            routes.handle_post(handler, SimpleNamespace(path=path))
+        except BaseException as exc:  # surfaced by the assertions below
+            errors["A"] = exc
+
+    thread_a = threading.Thread(target=run_writer, name="writer-A", daemon=True)
+    thread_a.start()
+    assert paused.wait(20), (
+        f"{path} never resolved its session while holding the agent lock. "
+        f"Resolving BEFORE taking the lock is exactly the defect: the writer "
+        f"would hold a resolved object it does not own, so an idle tick can "
+        f"evict the cache entry out from under it."
+    )
+
+    _insert_without_eviction(_make_persisted_session(7305))
+    assert len(_cfg.SESSIONS) > _cfg.SESSIONS_MAX
+
+    original_interval = _start_real_reaper(bp)
+    try:
+        deadline = time.time() + 20.0
+        while time.time() < deadline and len(_cfg.SESSIONS) > _cfg.SESSIONS_MAX:
+            time.sleep(0.02)
+
+        resident = _cfg.SESSIONS.get(sid)
+        assert resident is not None, (
+            f"{path} resolved its session outside the agent lock, so an idle "
+            f"tick evicted the entry it is mid-write on; the next resolve "
+            f"returns a different object and this writer persists a detached one"
+        )
+        assert resident is target, (
+            f"{path} resolved its session outside the agent lock; the idle tick "
+            f"replaced the cache entry with a different object, splitting one "
+            f"session id across two objects"
+        )
+    finally:
+        release.set()
+        thread_a.join(timeout=20)
+        bp.stop_session_channel_reaper()
+        bp._REAPER_INTERVAL_SECS = original_interval
+
+    assert not thread_a.is_alive(), f"{path} writer did not finish: {errors!r}"
+    assert not errors, f"{path} handler raised: {errors}"
+    assert captured.get("status") == 200, f"{path} did not return 200: {captured!r}"
+
+    # The acknowledged composer text must survive: a detached-object save
+    # rewrites composer_draft from the stale copy it resolved.
+    with _cfg.LOCK:
+        _cfg.SESSIONS.pop(sid, None)
+    cold = models.Session.load(sid)
+    assert (cold.composer_draft or {}).get("text") == "ORIGINAL TEXT", (
+        f"{path} wrote a detached object: the cold load holds "
+        f"{(cold.composer_draft or {}).get('text')!r} instead of the "
+        f"acknowledged text"
     )

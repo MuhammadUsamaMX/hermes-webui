@@ -18377,9 +18377,14 @@ def handle_post(handler, parsed) -> bool:
         if _session_is_subagent_view_only(sid):
             return bad(handler, "Subagent sessions are view-only and cannot be modified from WebUI", 400)
         name = body["name"].strip()
+        # Existence pre-check ONLY — the object written below is re-resolved
+        # inside the agent lock (#6351). An idle tick can evict this id from
+        # the SESSIONS LRU from a thread holding no session lock, so an object
+        # resolved out here can be detached from the cache before we write it;
+        # save() persists composer_draft in the same sidecar write, which rolls
+        # back acknowledged composer text we never touched.
         try:
-            s = get_session(sid)
-            s = _ensure_full_session_before_mutation(sid, s)
+            get_session(sid)
         except KeyError:
             return bad(handler, "Session not found", 404)
         # Resolve personality from config.yaml agent.personalities section
@@ -18409,9 +18414,18 @@ def handle_post(handler, parsed) -> bool:
                 prompt = "\n".join(p for p in parts if p)
             else:
                 prompt = str(value)
+        missing = False
         with _get_session_agent_lock(sid):
-            s.personality = name if name else None
-            s.save()
+            try:
+                s = _ensure_full_session_before_mutation(sid, get_session(sid))
+            except KeyError:
+                missing = True
+            else:
+                s.personality = name if name else None
+                s.save()
+        # Respond OUTSIDE the lock (lock contract: no response I/O under it).
+        if missing:
+            return bad(handler, "Session not found", 404)
         return j(handler, {"ok": True, "personality": s.personality, "prompt": prompt})
 
     if parsed.path == "/api/session/toolsets":
@@ -18432,13 +18446,30 @@ def handle_post(handler, parsed) -> bool:
             toolsets = _validate_session_toolsets_shape(toolsets)
         except ValueError as e:
             return bad(handler, str(e), status=400)
-        try:
-            s = get_session(sid)
-        except KeyError:
-            return bad(handler, "Session not found", 404)
+        # Resolve the session INSIDE the per-session agent lock (#6351).
+        #
+        # The idle reaper's sweep evicts this id from the SESSIONS LRU from a
+        # thread that holds no session lock, so a resolve performed BEFORE the
+        # lock is held can be evicted in between: the writer then persists an
+        # object the cache no longer owns. save() writes composer_draft and
+        # enabled_toolsets in the SAME sidecar write, so a detached object rolls
+        # back acknowledged composer text the writer never even touched.
+        # Holding the lock across the resolve gives the writer ownership —
+        # _session_has_live_metadata_writer() sees the held lock and keeps the
+        # entry resident until the write completes.
+        missing = False
         with _get_session_agent_lock(sid):
-            s.enabled_toolsets = toolsets
-            s.save()
+            try:
+                s = get_session(sid)
+            except KeyError:
+                missing = True
+            else:
+                s.enabled_toolsets = toolsets
+                s.save()
+        # Respond OUTSIDE the lock: the lock contract forbids holding it across
+        # response I/O.
+        if missing:
+            return bad(handler, "Session not found", 404)
         return j(handler, {"ok": True, "enabled_toolsets": s.enabled_toolsets})
 
     if parsed.path == "/api/session/draft":

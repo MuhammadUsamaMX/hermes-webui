@@ -27,12 +27,16 @@ from __future__ import annotations
 import collections
 import multiprocessing
 import shutil
+import sys
 import tempfile
 import threading
 import time
 from pathlib import Path
 
 import pytest
+
+sys.path.insert(0, str(Path(__file__).parent))
+from conftest import requires_fork
 
 PUBLISH_TIMEOUT_S = 20.0
 
@@ -149,7 +153,23 @@ def _run_publisher(old_sid, new_sid, agent_lock, result_q):
 
     Forked so the parent's isolated globals are inherited, and so a reintroduced
     deadlock can be terminated instead of wedging the test session.
+
+    ``predicate_calls`` counts how many times the eviction walk actually
+    consulted ``_session_has_live_metadata_writer`` — the call that re-enters
+    ``SESSION_AGENT_LOCKS_LOCK``. A bounded-completion assertion alone cannot
+    distinguish "the lock edge is safe" from "the eviction walk never ran",
+    so the count is reported and asserted separately.
     """
+    from api import models as _models
+
+    calls = {"n": 0}
+    _real_predicate = _models._session_has_live_metadata_writer
+
+    def _counting_predicate(session_id):
+        calls["n"] += 1
+        return _real_predicate(session_id)
+
+    _models._session_has_live_metadata_writer = _counting_predicate
     try:
         from api import streaming as _streaming
 
@@ -161,19 +181,32 @@ def _run_publisher(old_sid, new_sid, agent_lock, result_q):
             "old_resident": old_sid in _streaming.SESSIONS,
             "registry_old": old_sid in _streaming.SESSION_AGENT_LOCKS,
             "registry_new": new_sid in _streaming.SESSION_AGENT_LOCKS,
+            "predicate_calls": calls["n"],
+            # Measured in the CHILD: the fork gives it a private copy of the
+            # cache, so eviction never mutates the parent's dict and the
+            # parent's len() would say nothing about the walk.
+            "cache_len": len(_streaming.SESSIONS),
             "error": None,
         }
     except BaseException as exc:  # pragma: no cover - diagnostic path
-        outcome = {"published": None, "error": f"{type(exc).__name__}: {exc}"}
+        outcome = {
+            "published": None,
+            "predicate_calls": calls["n"],
+            "error": f"{type(exc).__name__}: {exc}",
+        }
     result_q.put(outcome)
 
 
+@requires_fork
 def test_compression_publish_completes_with_neighbour_at_cap(at_cap_env):
     """Publishing into an AT-cap cache completes and republishes ownership.
 
-    Cap 2, one active owner plus one clean disk-backed neighbour. Publishing the
-    continuation is the third key, so the eviction walk runs and reaches the
-    neighbour — the exact path that re-enters ``SESSION_AGENT_LOCKS_LOCK``.
+    Cap 2, one active owner plus one clean disk-backed neighbour. The old alias
+    is retired BEFORE the eviction walk (the ordering this PR introduced), so
+    the cache is back at cap when the walk runs and the walk stops on the
+    length check without visiting a candidate. That makes this case a guard on
+    the publish/retire ordering only; the walk's own lock edge is covered by
+    ``test_over_cap_publish_reaches_the_writer_predicate_without_deadlocking``.
     """
     from api import config as _cfg
     from api import streaming as _streaming
@@ -236,5 +269,105 @@ def test_compression_publish_completes_with_neighbour_at_cap(at_cap_env):
         blocking=False
     ), "SESSION_AGENT_LOCKS_LOCK still held after publish"
     _cfg.SESSION_AGENT_LOCKS_LOCK.release()
+
+    agent_lock.release()
+
+
+@requires_fork
+def test_over_cap_publish_reaches_the_writer_predicate_without_deadlocking(at_cap_env):
+    """An ALREADY-over-cap cache must reach the predicate — and not deadlock.
+
+    The at-cap case above can no longer reach it: the old alias is retired
+    before the walk, so a cap-two cache goes 2 → 1 → 2 and the walk stops on
+    ``len(SESSIONS) <= cap`` without visiting a candidate. Moving eviction back
+    under ``SESSION_AGENT_LOCKS_LOCK`` would still pass that test, so it does
+    not on its own guard the lock edge this PR introduced.
+
+    Starting one key OVER cap makes the walk run regardless of the retire
+    ordering: retire leaves 2, publishing the continuation makes 3, so the
+    walk must call ``_session_is_evictable()`` →
+    ``_session_has_live_metadata_writer()``. That call re-enters the
+    non-reentrant ``SESSION_AGENT_LOCKS_LOCK`` on this same thread, so the
+    publisher is only safe because the eviction runs outside it.
+
+    The ``predicate_calls`` assertion is what makes this discriminating: it
+    fails if the walk stops short, so the bounded-completion check below can
+    no longer pass by never reaching the dangerous call.
+    """
+    from api import config as _cfg
+    from api import streaming as _streaming
+
+    old_sid, new_sid = "sess_over_cap_old", "sess_over_cap_new"
+
+    owner = _persisted_session(old_sid, "Owner")
+    owner.pre_compression_snapshot = True
+    # Two clean disk-backed neighbours: the walk reaches the first one.
+    n1 = _persisted_session("sess_over_cap_n1", "Neighbour1")
+    n2 = _persisted_session("sess_over_cap_n2", "Neighbour2")
+
+    with _cfg.LOCK:
+        _cfg.SESSIONS[old_sid] = owner
+        _cfg.SESSIONS.move_to_end(old_sid)
+        _cfg.SESSIONS[n1.session_id] = n1
+        _cfg.SESSIONS.move_to_end(n1.session_id)
+        _cfg.SESSIONS[n2.session_id] = n2
+        _cfg.SESSIONS.move_to_end(n2.session_id)
+
+    agent_lock = threading.Lock()
+    _cfg.SESSION_AGENT_LOCKS[old_sid] = agent_lock
+    _cfg.SESSION_AGENT_LOCKS[new_sid] = agent_lock
+    agent_lock.acquire()
+
+    # Precondition: genuinely OVER cap before the publish, so the walk cannot
+    # be skipped by the retire-then-publish ordering.
+    assert len(_cfg.SESSIONS) == 3, "this case must start over cap"
+    assert _cfg.SESSIONS_MAX == 2
+    assert _streaming.SESSIONS is _cfg.SESSIONS
+
+    ctx = multiprocessing.get_context("fork")
+    result_q = ctx.Queue()
+    child = ctx.Process(
+        target=_run_publisher, args=(old_sid, new_sid, agent_lock, result_q)
+    )
+    child.start()
+    child.join(PUBLISH_TIMEOUT_S)
+
+    if child.is_alive():
+        child.terminate()
+        child.join(5)
+        pytest.fail(
+            "compression publication deadlocked on an already-over-cap cache: "
+            f"_migrate_compression_session_ownership() did not return within "
+            f"{PUBLISH_TIMEOUT_S}s (regression: eviction ran while "
+            "SESSION_AGENT_LOCKS_LOCK was held)"
+        )
+
+    assert not result_q.empty(), "publisher child produced no result"
+    outcome = result_q.get(timeout=5)
+
+    assert outcome.get("error") is None, outcome.get("error")
+    assert outcome["published"] is True, outcome
+    assert outcome["predicate_calls"] >= 1, (
+        "the eviction walk never consulted _session_has_live_metadata_writer, "
+        "so this test did not exercise the lock edge it claims to cover "
+        f"(predicate_calls={outcome['predicate_calls']})"
+    )
+    assert outcome["new_resident"] is True, "continuation was not published"
+    assert outcome["old_resident"] is False, "old alias was not retired"
+    assert outcome["registry_new"] is True, "continuation lost its agent lock"
+    assert outcome["registry_old"] is True, "old alias lost its agent lock"
+
+    # Both locks must be free again, and the over-cap cache must have been
+    # flattened to the cap — measured in the child, which owns a private copy.
+    assert _cfg.LOCK.acquire(blocking=False), "cache LOCK still held after publish"
+    _cfg.LOCK.release()
+    assert _cfg.SESSION_AGENT_LOCKS_LOCK.acquire(
+        blocking=False
+    ), "SESSION_AGENT_LOCKS_LOCK still held after publish"
+    _cfg.SESSION_AGENT_LOCKS_LOCK.release()
+    assert outcome["cache_len"] <= _cfg.SESSIONS_MAX, (
+        f"an over-cap cache must be flattened by the publish: "
+        f"{outcome['cache_len']} > {_cfg.SESSIONS_MAX}"
+    )
 
     agent_lock.release()

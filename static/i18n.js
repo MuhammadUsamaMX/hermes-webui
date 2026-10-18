@@ -13809,6 +13809,8 @@ const LOCALES = {
     settings_tab_preferences: '偏好設定',
     settings_tab_plugins: '外掛',
     settings_tab_extensions: '擴充功能',
+    settings_tab_messaging: '訊息',
+    settings_messaging_meta: '為此設定檔連接訊息機器人。權杖會在儲存前透過 Telegram 驗證，且不會再次顯示。',
     settings_extensions_gallery_tab: 'Gallery',
     settings_extensions_installed_tab: 'Installed',
     settings_extensions_diagnostics_tab: 'Diagnostics',

@@ -977,6 +977,9 @@ const LOCALES = {
     settings_label_kanban_sessions: 'Show kanban sessions',
     settings_label_previous_messaging_sessions: 'Show previous messaging sessions',
     settings_label_sync_insights: 'Sync to insights',
+    // #8185: pricing overrides for routes the Agent core cannot price.
+    settings_label_pricing_overrides: 'Pricing overrides (JSON)',
+    settings_desc_pricing_overrides: 'Per-model costs for routes the Agent cannot price (Ollama cloud, LM Studio, local OpenAI-compatible servers). Map of model name (or "provider:model") to {"free": true} or per-million-token USD rates. Applied to Insights only where no cost was recorded.',
     settings_label_check_updates: 'Check for updates',
     settings_label_update_channel: 'Update channel',
     settings_update_channel_stable: 'Stable (recommended)',
@@ -1203,6 +1206,9 @@ const LOCALES = {
     insights_tokens: 'Tokens',
     insights_cost: 'Estimated Cost',
     insights_no_cost: 'N/A',
+    // #8185: the card explains its N/A — {0} = unpriceable session count,
+    // {1} = comma-separated model names lacking a pricing source.
+    insights_cost_unknown_hint: 'Pricing unknown for {0} session(s): no rate source for {1}. Add per-model rates (or free:true) under Settings → Pricing overrides.',
     insights_models: 'Models',
     insights_activity_by_day: 'Activity by Day',
     insights_activity_by_hour: 'Activity by Hour',

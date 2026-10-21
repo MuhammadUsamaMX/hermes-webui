@@ -11,6 +11,7 @@ import math
 import os
 import re
 import sqlite3
+import stat as _stat
 import threading
 import time
 import uuid
@@ -9295,6 +9296,37 @@ def _default_aider_scan_dir(
     return None
 
 
+def _aider_scan_root(
+    scan_dir: Path | str | None = None,
+    *,
+    workspace: str | None = None,
+    profile: str | None = None,
+) -> Path | None:
+    """Resolve the ONE bounded root the aider bridge scans, or None.
+
+    Shared by the scanner and the readers so both agree on the exact root: the
+    reader needs it to re-check containment at the point of use (a path is
+    only readable through the directory handles of the root it was found
+    under). A symlinked root is refused outright, exactly like the walk does.
+    """
+    root = (
+        Path(scan_dir).expanduser()
+        if scan_dir is not None
+        else _default_aider_scan_dir(workspace, profile=profile)
+    )
+    if root is None:
+        return None
+    try:
+        if root.is_symlink():
+            return None
+        root = root.resolve(strict=False)
+        if not root.exists() or not root.is_dir():
+            return None
+    except OSError:
+        return None
+    return root
+
+
 def _aider_session_id(path: Path) -> str:
     digest = hashlib.sha256(str(path.expanduser().resolve()).encode('utf-8')).hexdigest()[:24]
     return f'{AIDER_SOURCE}_{digest}'
@@ -9348,48 +9380,168 @@ def _join_aider_lines(lines: list[str]) -> str:
     return '\n'.join(line.rstrip() for line in lines[start:end])
 
 
+def _open_aider_history_fd(path: Path, root: Path | None) -> int | None:
+    """Open an aider history file for reading, refusing links.
+
+    The scanner already refused symlinked entries, but that check happened in
+    an EARLIER step: the file -- or a directory above it -- can be replaced
+    with a symlink before the read. Open through checked directory handles
+    (``O_NOFOLLOW`` on every component, relative to the scan root) so a
+    swapped symlink cannot redirect the read outside the root, and cap what is
+    read from the opened file.
+
+    Returns the open file descriptor, or None when the file cannot be opened
+    safely.
+    """
+    nofollow = getattr(os, 'O_NOFOLLOW', 0)
+    if root is not None and os.open in os.supports_dir_fd:
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            return None
+        if not relative.parts:
+            return None
+        dir_flags = (
+            os.O_RDONLY
+            | getattr(os, 'O_DIRECTORY', 0)
+            | nofollow
+        )
+        try:
+            dir_fd = os.open(root, dir_flags)
+        except OSError:
+            return None
+        try:
+            for part in relative.parts[:-1]:
+                next_fd = os.open(part, dir_flags, dir_fd=dir_fd)
+                os.close(dir_fd)
+                dir_fd = next_fd
+            fd = os.open(
+                relative.parts[-1],
+                os.O_RDONLY | nofollow,
+                dir_fd=dir_fd,
+            )
+        except OSError:
+            return None
+        finally:
+            os.close(dir_fd)
+        return fd
+    # Portable fallback (no dir_fd support): refuse a symlinked leaf and
+    # keep the read inside the root.
+    try:
+        if root is not None:
+            resolved = os.path.realpath(path)
+            root_resolved = os.path.realpath(root)
+            if not (
+                resolved == root_resolved
+                or resolved.startswith(root_resolved + os.sep)
+            ):
+                return None
+        return os.open(path, os.O_RDONLY | nofollow)
+    except OSError:
+        return None
+
+
+def _read_aider_history_text(
+    path: Path, *, root: Path | None, max_bytes: int
+) -> str | None:
+    """Read an aider history file with containment checked AT THE POINT OF USE.
+
+    The scanner's size check is advisory by the time the file is read: a file
+    that grows after the check must not be read without limit, and a file that
+    was replaced by a symlink must not be followed. Returns the decoded text,
+    or None when the file cannot be read safely.
+    """
+    fd = _open_aider_history_fd(path, root)
+    if fd is None:
+        return None
+    try:
+        try:
+            st = os.fstat(fd)
+        except OSError:
+            return None
+        if not _stat.S_ISREG(st.st_mode):
+            return None
+        if st.st_size > max_bytes:
+            return None
+        chunks: list[bytes] = []
+        remaining = max_bytes
+        while remaining > 0:
+            try:
+                chunk = os.read(fd, min(65536, remaining))
+            except OSError:
+                return None
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    finally:
+        os.close(fd)
+    return b"".join(chunks).decode('utf-8', errors='replace')
+
+
 def _parse_aider_chat_history(
-    path: Path, *, max_messages: int = AIDER_MAX_MESSAGES_PER_FILE
-) -> tuple[list[dict], float | None]:
-    """Parse one `.aider.chat.history.md` into ``(messages, started_at)``.
+    path: Path,
+    *,
+    max_messages: int = AIDER_MAX_MESSAGES_PER_FILE,
+    max_bytes: int = AIDER_MAX_FILE_BYTES,
+    root: Path | None = None,
+) -> tuple[list[dict], float | None, str | None]:
+    """Parse one `.aider.chat.history.md` into ``(messages, started_at, title)``.
 
     Role assignment follows ``aider/utils.py:148``
     (``split_chat_history_markdown``): a ``#### `` line starts a *user* turn,
     a ``> `` line is a blockquoted tool/confirm prompt, and any other bare line
     continues the *assistant* turn. ``# `` header lines are skipped.
+
+    The transcript is APPEND-ONLY, so ``max_messages`` keeps the NEWEST
+    messages: a growing history must not freeze on its first thousand turns
+    while the sidebar timestamp keeps moving. The first user turn is returned
+    separately as the title hint, because it falls outside the window once
+    the history grows past the cap.
+
+    The file is read with containment checked AT THE POINT OF USE (see
+    ``_read_aider_history_text``): the scanner's checks ran in an earlier
+    step, and the file can be replaced before the read.
     """
-    messages: list[dict] = []
     started_at = None
+    title_hint: str | None = None
+    seq = 0
+    # Bounded rolling window: appending past max_messages evicts the OLDEST
+    # message, so the transcript always shows the most recent turns.
+    window: collections.deque[dict] = collections.deque(maxlen=max_messages)
     user: list[str] = []
     assistant: list[str] = []
     tool: list[str] = []
-    try:
-        text = path.read_text(encoding='utf-8', errors='replace')
-    except OSError:
-        return [], None
+    text = _read_aider_history_text(path, root=root, max_bytes=max_bytes)
+    if text is None:
+        return [], None, None
 
     def flush(role: str, lines: list[str]):
+        nonlocal seq, title_hint
         content = _join_aider_lines(lines)
         lines.clear()
         if not content.strip():
             return
-        if len(messages) >= max_messages:
-            return
         if len(content) > AIDER_MAX_CONTENT_CHARS:
             content = content[:AIDER_MAX_CONTENT_CHARS]
+        if role == 'user' and title_hint is None:
+            # The title comes from the FIRST user turn of the file, which the
+            # newest-messages window no longer contains.
+            title_hint = content
         if role != 'tool':
-            messages.append({'role': role, 'content': content})
+            window.append({'role': role, 'content': content})
+            seq += 1
             return
         # A blockquoted ask/confirm prompt is a tool turn, but a bare role=tool
         # row is NOT renderable: _messageIsRenderable() drops every role=tool
         # message, so the confirmation vanished from the transcript entirely.
-        # The frontend builds tool cards from the CALL side (an assistant row
-        # carrying tool_calls) and joins the result back by tool_call_id
+        # The frontend builds tool cards from the CALL side (an assistant
+        # row carrying tool_calls) and joins the result back by tool_call_id
         # (static/ui.js: _legacySettledFallbackHasToolMetadata + resultsByTid),
         # so emit a matching synthetic assistant call ahead of the result --
         # the same shape the state.db CLI importer produces.
-        call_id = f'{AIDER_SOURCE}_{len(messages)}'
-        messages.append({
+        call_id = f'{AIDER_SOURCE}_{seq}'
+        window.append({
             'role': 'assistant',
             'content': '',
             'tool_calls': [{
@@ -9401,17 +9553,16 @@ def _parse_aider_chat_history(
                 },
             }],
         })
-        messages.append({
+        window.append({
             'role': 'tool',
             'content': content,
             'tool_call_id': call_id,
             'tool_name': AIDER_CONFIRM_TOOL,
             'name': AIDER_CONFIRM_TOOL,
         })
+        seq += 1
 
     for line in text.splitlines():
-        if len(messages) >= max_messages:
-            break
         if started_at is None and line.strip().startswith('# aider chat started at'):
             started_at = _parse_aider_started_at(line)
         if line.startswith('# '):
@@ -9433,35 +9584,68 @@ def _parse_aider_chat_history(
     flush('assistant', assistant)
     flush('user', user)
     flush('tool', tool)
-    return messages, started_at
+    messages = list(window)
+    # The window evicts from the left, so it can start with a tool result
+    # whose assistant declaration was evicted. A bare role=tool row is not
+    # renderable on its own, so drop that orphan.
+    while messages and messages[0].get('role') == 'tool':
+        messages.pop(0)
+    return messages, started_at, title_hint
 
 
 def _parse_aider_chat_history_cached(
-    path: Path, *, max_messages: int = AIDER_MAX_MESSAGES_PER_FILE
-) -> tuple[list[dict], float | None]:
-    """``_parse_aider_chat_history`` memoized by (path, mtime_ns, size, ctime_ns)."""
-    try:
-        st = path.stat()
-    except OSError:
-        return _parse_aider_chat_history(path, max_messages=max_messages)
+    path: Path,
+    *,
+    max_messages: int = AIDER_MAX_MESSAGES_PER_FILE,
+    max_bytes: int = AIDER_MAX_FILE_BYTES,
+    root: Path | None = None,
+) -> tuple[list[dict], float | None, str | None]:
+    """``_parse_aider_chat_history`` memoized by (path, mtime_ns, size, ctime_ns).
 
-    key = (str(path), st.st_mtime_ns, st.st_size, st.st_ctime_ns, int(max_messages))
+    The key uses ``lstat`` so a path swapped for a symlink cannot reuse the
+    entry cached for the regular file it replaced, and it carries the read
+    bounds so a differently-bounded parse never answers for another one.
+    """
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return _parse_aider_chat_history(
+            path,
+            max_messages=max_messages,
+            max_bytes=max_bytes,
+            root=root,
+        )
+
+    key = (
+        str(path),
+        st.st_mtime_ns,
+        st.st_size,
+        st.st_ctime_ns,
+        int(max_messages),
+        int(max_bytes),
+        str(root or ''),
+    )
     with _AIDER_PARSE_CACHE_LOCK:
         hit = _AIDER_PARSE_CACHE.get(key)
         if hit is not None:
             _AIDER_PARSE_CACHE.move_to_end(key)
-            messages, started_at = hit
-            return list(messages), started_at
+            messages, started_at, title_hint = hit
+            return list(messages), started_at, title_hint
 
-    parsed = _parse_aider_chat_history(path, max_messages=max_messages)
+    parsed = _parse_aider_chat_history(
+        path,
+        max_messages=max_messages,
+        max_bytes=max_bytes,
+        root=root,
+    )
     with _AIDER_PARSE_CACHE_LOCK:
         if _AIDER_PARSE_CACHE.get(key) is None:
             _AIDER_PARSE_CACHE[key] = parsed
             _AIDER_PARSE_CACHE.move_to_end(key)
             while len(_AIDER_PARSE_CACHE) > _AIDER_PARSE_CACHE_MAX:
                 _AIDER_PARSE_CACHE.popitem(last=False)
-    messages, started_at = parsed
-    return list(messages), started_at
+    messages, started_at, title_hint = parsed
+    return list(messages), started_at, title_hint
 
 
 def clear_aider_parse_cache() -> None:
@@ -9504,6 +9688,7 @@ def _iter_aider_chat_history_files(
     max_depth: int = AIDER_MAX_SCAN_DEPTH,
     workspace: str | None = None,
     profile: str | None = None,
+    root: Path | None = None,
 ):
     """Yield `.aider.chat.history.md` files under one bounded root.
 
@@ -9516,22 +9701,27 @@ def _iter_aider_chat_history_files(
     ``profile`` scopes the fallback scan-root resolve to the same profile the
     sidebar list used, so a listed conversation resolves to the same git root
     when it is opened.
+
+    ``root`` lets the caller pass the ALREADY resolved root (see
+    ``_aider_scan_root``) so the walker and the reader agree on one exact
+    directory: the reader re-checks containment against it at the point of use.
     """
-    root = (
-        Path(scan_dir).expanduser()
-        if scan_dir is not None
-        else _default_aider_scan_dir(workspace, profile=profile)
-    )
     if root is None:
-        return
-    try:
-        if root.is_symlink():
+        root = (
+            Path(scan_dir).expanduser()
+            if scan_dir is not None
+            else _default_aider_scan_dir(workspace, profile=profile)
+        )
+        if root is None:
             return
-        root = root.resolve(strict=False)
-        if not root.exists() or not root.is_dir():
+        try:
+            if root.is_symlink():
+                return
+            root = root.resolve(strict=False)
+            if not root.exists() or not root.is_dir():
+                return
+        except OSError:
             return
-    except OSError:
-        return
 
     yielded = 0
     visited = 0
@@ -9579,8 +9769,18 @@ def _iter_aider_chat_history_files(
             continue
 
 
-def _aider_title(messages: list[dict]) -> str:
-    """Aider stores no session title; infer it from the first user turn."""
+def _aider_title(messages: list[dict], title_hint: str | None = None) -> str:
+    """Aider stores no session title; infer it from the first user turn.
+
+    ``title_hint`` is the FIRST user turn of the whole file, captured while
+    parsing. The transcript window keeps the NEWEST messages, so the first
+    user turn can fall outside it -- and a title that changed every time the
+    window slid would be worse than no title at all.
+    """
+    if title_hint:
+        text = ' '.join(str(title_hint).split())
+        if text:
+            return text[:80]
     for msg in messages:
         if msg.get('role') == 'user':
             text = ' '.join(str(msg.get('content') or '').split())
@@ -9616,14 +9816,25 @@ def get_aider_sessions(
     aider_workspace = (
         workspace if workspace is not None else _aider_profile_workspace(profile)
     )
+    # The scan root is resolved ONCE and threaded to both the walker and the
+    # reader: the reader re-checks containment against this exact root at the
+    # point of use, so both sides must agree on which directory it is.
+    scan_root = _aider_scan_root(
+        scan_dir, workspace=aider_workspace, profile=profile
+    )
     for path in _iter_aider_chat_history_files(
         scan_dir,
         max_files=max_files,
         max_file_bytes=max_file_bytes,
         workspace=aider_workspace,
         profile=profile,
+        root=scan_root,
     ) or []:
-        messages, started_at = _parse_aider_chat_history_cached(path)
+        messages, started_at, title_hint = _parse_aider_chat_history_cached(
+            path,
+            max_bytes=max_file_bytes,
+            root=scan_root,
+        )
         if not messages:
             continue
         try:
@@ -9636,7 +9847,7 @@ def get_aider_sessions(
         updated_at = mtime or created_at
         sessions.append({
             'session_id': _aider_session_id(path),
-            'title': _aider_title(messages),
+            'title': _aider_title(messages, title_hint),
             'workspace': aider_workspace,
             'model': AIDER_SOURCE,
             'message_count': len(messages),
@@ -9674,10 +9885,18 @@ def get_aider_session_messages(
     sid = str(sid or '')
     if not sid.startswith(f'{AIDER_SOURCE}_'):
         return []
-    for path in _iter_aider_chat_history_files(scan_dir, profile=profile) or []:
+    # Resolve the scan root ONCE and share it with the walker and the reader:
+    # the reader re-checks containment against this exact root at the point of
+    # use, so both sides must agree on which directory it is.
+    scan_root = _aider_scan_root(scan_dir, profile=profile)
+    for path in _iter_aider_chat_history_files(
+        scan_dir, profile=profile, root=scan_root
+    ) or []:
         if _aider_session_id(path) != sid:
             continue
-        messages, _started_at = _parse_aider_chat_history_cached(path)
+        messages, _started_at, _title_hint = _parse_aider_chat_history_cached(
+            path, root=scan_root
+        )
         return messages
     return []
 

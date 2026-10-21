@@ -976,6 +976,38 @@ def _is_profile_agnostic_foreign_session(cli_meta) -> bool:
     return bool(sources & profile_agnostic_sources)
 
 
+def _is_active_profile_aider_row(row) -> bool:
+    """Return whether an Aider row belongs to the ACTIVE profile.
+
+    Aider has no global store: the bridge scans exactly ONE bounded root,
+    resolved from the ACTIVE profile's own ``last_workspace`` git root
+    (``get_aider_sessions``). Every Aider row in a payload therefore belongs
+    to the active profile BY CONSTRUCTION, even though the row itself carries
+    ``profile: None`` -- the transcript lives in a git root, not inside a
+    Hermes profile tree, which is what makes the ``aider_`` id prefix the
+    read-only identity.
+
+    ``_profiles_match`` coerces a missing profile to ``'default'``, so the
+    sidebar scope filter dropped every Aider row under a named (non-root)
+    active profile and "Show Aider sessions" showed nothing at all. Exempt
+    these rows from the LIST scope filter; the detail-load gate keeps its own
+    exemption in ``_is_profile_agnostic_foreign_session``.
+
+    Only Aider is exempt here. Claude Code rows are profile-less too, but
+    their store is GLOBAL (``~/.claude/projects``), not profile-bound, so
+    they keep the upstream behaviour unchanged.
+    """
+    if not isinstance(row, dict):
+        return False
+    if row.get("profile"):
+        return False
+    sources = {
+        str(row.get("source_tag") or "").strip().lower(),
+        str(row.get("raw_source") or "").strip().lower(),
+    }
+    return AIDER_SOURCE in sources
+
+
 def _request_session_visibility_exempt(method: str, path: str | None) -> bool:
     if not path:
         return False
@@ -2997,7 +3029,18 @@ def _build_session_list_cache_payload(
         scoped = merged
         other_profile_count = 0
     else:
-        scoped = [s for s in merged if _profiles_match(s.get("profile"), active_profile)]
+        # Aider rows are profile-less by design (the transcript lives in a git
+        # root, not a Hermes profile tree), but the bridge scans exactly ONE
+        # bounded root resolved from the ACTIVE profile's own workspace -- so
+        # every Aider row belongs to the active profile by construction.
+        # _profiles_match coerces the missing profile to 'default', which
+        # dropped every Aider row under a named (non-root) active profile and
+        # left "Show Aider sessions" showing nothing at all.
+        scoped = [
+            s for s in merged
+            if _profiles_match(s.get("profile"), active_profile)
+            or _is_active_profile_aider_row(s)
+        ]
         other_profile_count = 0 if _is_isolated_profile_mode() else len(merged) - len(scoped)
     diag_stage("messaging_dedupe")
     archived_scoped = _keep_latest_messaging_session_per_source(

@@ -26,6 +26,7 @@ These tests pin:
 
 from __future__ import annotations
 
+import json
 from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -354,8 +355,15 @@ class TestFailSoft:
 
 
 class TestSkillContentLookup:
-    def _resolve(self, name, *, manager, skills_dir, file=None):
-        """Drive the /api/skills/content route with plugins pinned."""
+    def _resolve(self, name, *, manager, skills_dir, file=None, native_view=None):
+        """Drive the /api/skills/content route with plugins pinned.
+
+        ``native_view`` is the JSON payload the Agent's native ``skill_view``
+        returns for a plugin skill. The route delegates plugin content to that
+        native viewer (contract parity with the Agent, #7770), and the native
+        viewer resolves against the *real* registry — so a fake manager's path
+        is unknown to it and the delegate has to be pinned for these tests.
+        """
         import api.routes as routes
 
         captured = {}
@@ -383,6 +391,13 @@ class TestSkillContentLookup:
             stack.enter_context(
                 patch.object(routes, "_get_plugin_manager_for_visibility", return_value=manager)
             )
+            if native_view is not None:
+                stack.enter_context(
+                    patch(
+                        "tools.skills_tool.skill_view",
+                        return_value=json.dumps(native_view),
+                    )
+                )
             handled = routes.handle_get(handler, parsed)
         assert handled is True, "route did not handle /api/skills/content"
         return captured
@@ -396,11 +411,56 @@ class TestSkillContentLookup:
         manager = _FakePluginManager(find_paths={"superpowers:brainstorming": skill_md})
 
         captured = self._resolve(
-            "superpowers:brainstorming", manager=manager, skills_dir=skills_dir
+            "superpowers:brainstorming",
+            manager=manager,
+            skills_dir=skills_dir,
+            native_view={
+                "success": True,
+                "name": "superpowers:brainstorming",
+                "content": "Brainstorm body",
+            },
         )
 
         assert captured["status"] == 200, captured["payload"]
         assert "Brainstorm" in captured["payload"]["content"] or captured["payload"]["content"]
+
+    def test_plugin_skill_content_is_delegated_to_the_native_viewer(self, tmp_path):
+        """The route must serve plugin content through the Agent's native
+        skill_view, not the directory thin-reader.
+
+        The native viewer is the only source of the qualified name, the
+        expanded ``${HERMES_SKILL_DIR}``, nested linked files and the bundle
+        banner (#7770). A directory-style payload would drop all of them.
+        """
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        skill_md = _write_plugin_skill(
+            tmp_path / "plugins", qualified_name="superpowers:brainstorming"
+        )
+        manager = _FakePluginManager(find_paths={"superpowers:brainstorming": skill_md})
+
+        captured = self._resolve(
+            "superpowers:brainstorming",
+            manager=manager,
+            skills_dir=skills_dir,
+            native_view={
+                "success": True,
+                "name": "superpowers:brainstorming",
+                "content": "body with ${HERMES_SKILL_DIR} expanded",
+                "linked_files": {
+                    "references": ["references/top.md", "references/nested/guide.md"],
+                    "scripts": ["scripts/run.sh"],
+                },
+                "bundle": "watchplugin bundle banner",
+            },
+        )
+
+        payload = captured["payload"]
+        assert payload["name"] == "superpowers:brainstorming", payload
+        assert "${HERMES_SKILL_DIR}" in payload["content"], payload
+        # Nested linked files survive — the directory reader only found top.md.
+        assert "references/nested/guide.md" in payload["linked_files"]["references"], payload
+        assert payload.get("bundle") == "watchplugin bundle banner", payload
 
     def test_plugin_linked_file_resolves_through_plugin_manager(self, tmp_path):
         skills_dir = tmp_path / "skills"
@@ -553,3 +613,97 @@ class TestSkillToggleAcceptsPluginSkills:
         )
 
         assert captured["status"] == 404, captured["payload"]
+
+
+class TestPluginSkillsAreReadOnly:
+    """A plugin-provided skill is owned by the plugin package (#7770).
+
+    The Skills panel's Edit control would write only ``SKILL.md`` into the
+    profile's local ``skills/`` tree, leaving an incomplete copy that shadows
+    the plugin's real skill and drops its linked files; Delete could only ever
+    404 while the plugin kept serving the skill. The API refuses both writes,
+    so the broken state is unreachable even by a direct request.
+    """
+
+    def _write(self, action, *, manager, skills_dir, body):
+        import api.routes as routes
+
+        captured = {}
+
+        def fake_j(_handler, payload, status=200, extra_headers=None):
+            captured["payload"] = payload
+            captured["status"] = status
+            return True
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(routes, "j", side_effect=fake_j))
+            stack.enter_context(patch.object(routes, "bad", side_effect=fake_j))
+            stack.enter_context(patch.object(routes, "_active_skills_dir", return_value=skills_dir))
+            stack.enter_context(
+                patch.object(routes, "_active_skill_search_dirs", return_value=[skills_dir])
+            )
+            stack.enter_context(
+                patch.object(routes, "_get_plugin_manager_for_visibility", return_value=manager)
+            )
+            if action == "save":
+                routes._handle_skill_save(MagicMock(), body)
+            else:
+                routes._handle_skill_delete(MagicMock(), body)
+        return captured
+
+    def test_saving_a_plugin_skill_is_refused(self, tmp_path):
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        skill_md = _write_plugin_skill(
+            tmp_path / "plugins", qualified_name="superpowers:brainstorming"
+        )
+        manager = _FakePluginManager(find_paths={"superpowers:brainstorming": skill_md})
+
+        captured = self._write(
+            "save",
+            manager=manager,
+            skills_dir=skills_dir,
+            body={"name": "superpowers:brainstorming", "content": "---\nname: x\n---\n"},
+        )
+
+        assert captured["status"] == 409, captured["payload"]
+        # No partial local copy was written next to the plugin's real skill.
+        assert not (skills_dir / "superpowers:brainstorming").exists()
+        assert not (skills_dir / "superpowers").exists()
+
+    def test_deleting_a_plugin_skill_is_refused(self, tmp_path):
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        skill_md = _write_plugin_skill(
+            tmp_path / "plugins", qualified_name="superpowers:brainstorming"
+        )
+        manager = _FakePluginManager(find_paths={"superpowers:brainstorming": skill_md})
+
+        captured = self._write(
+            "delete",
+            manager=manager,
+            skills_dir=skills_dir,
+            body={"name": "superpowers:brainstorming"},
+        )
+
+        assert captured["status"] == 409, captured["payload"]
+
+    def test_a_directory_skill_with_a_colon_is_still_editable(self, tmp_path):
+        """Only registered plugin skills are read-only.
+
+        A local skill whose name merely contains a colon is not owned by a
+        plugin and must keep working exactly as before.
+        """
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        _write_local_skill(skills_dir, name="weird:name")
+        manager = _FakePluginManager(find_paths={})
+
+        captured = self._write(
+            "save",
+            manager=manager,
+            skills_dir=skills_dir,
+            body={"name": "weird:name", "content": "---\nname: weird:name\n---\n\nbody\n"},
+        )
+
+        assert captured["status"] == 200, captured["payload"]

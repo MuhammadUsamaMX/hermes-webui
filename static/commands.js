@@ -2605,14 +2605,22 @@ function _buildSkillCommandEntry(skill){
   const slug=_skillCommandSlug(skillName);
   if(!slug)return null;
   if(_getReservedSlashCommandSlugs().has(slug)) return null;
-  const entry={name:slug,desc:String(skill&&skill.description||'').trim()||t('slash_skill_desc'),source:'skill',skillName};
+  // A plugin-qualified id must round-trip VERBATIM. The Agent keys plugin
+  // skills as ``/<namespace>:<skill>`` and resolves that exact spelling
+  // (``resolve_skill_command_key`` tries the qualified form before the
+  // underscore/hyphen fallback), so slugifying ``my_plugin:my_skill`` into
+  // ``my-plugin:my-skill`` produced a command the Agent cannot resolve (#7770).
+  // Directory skills keep the slug: their Agent-side key is the slug too.
+  const isPlugin=!!(skill&&skill.source==='plugin');
+  const name=isPlugin?skillName.toLowerCase():slug;
+  const entry={name,desc:String(skill&&skill.description||'').trim()||t('slash_skill_desc'),source:'skill',skillName};
   // Carry the plugin namespace so the row can be labelled as plugin-provided.
   // The backend sends `plugin` for plugin-registered skills (#7770); derive it
   // from the qualified name when the marker is absent so an older backend (or a
   // directory skill that merely contains a colon) is not mislabelled.
-  if(skill&&skill.source==='plugin'&&skill.plugin){
+  if(isPlugin&&skill.plugin){
     entry.plugin=String(skill.plugin);
-  }else if(skill&&skill.source==='plugin'&&skillName.includes(':')){
+  }else if(isPlugin&&skillName.includes(':')){
     const ns=skillName.split(':',1)[0].trim();
     if(ns) entry.plugin=ns;
   }

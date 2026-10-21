@@ -228,6 +228,66 @@ def test_non_plugin_skill_with_colon_gets_no_namespace_label():
     assert entry["plugin"] == "", result
 
 
+def test_plugin_underscore_id_is_offered_verbatim():
+    """A plugin id containing underscores must be offered with the underscores
+    intact, and the hyphenated form must not be offered.
+
+    The Agent keys plugin skills as ``/<namespace>:<skill>`` with the
+    qualified name preserved (``_scan_plugin_skill_commands``), and
+    ``resolve_skill_command_key`` tries that exact spelling before the
+    underscore/hyphen fallback. A slugified ``my-plugin:my-skill`` therefore
+    resolves to nothing and the Agent's ``skill_view`` reports it as not
+    found (#7770).
+    """
+    skills = [
+        {
+            "name": "my_plugin:my_skill",
+            "description": "Underscore id",
+            "source": "plugin",
+            "plugin": "my_plugin",
+            "disabled": False,
+        }
+    ]
+    result = _run_commands_js(
+        """
+        await loadPicker();
+        return { names: await skillNames('/my_plugin') };
+        """,
+        skills,
+    )
+
+    assert "my_plugin:my_skill" in result["names"], result
+    assert "my-plugin:my-skill" not in result["names"], result
+
+
+def test_plugin_underscore_id_entry_carries_the_verbatim_name():
+    """The offered entry (and therefore the inserted command) keeps the
+    qualified spelling the Agent resolves."""
+    skills = [
+        {
+            "name": "my_plugin:my_skill",
+            "description": "Underscore id",
+            "source": "plugin",
+            "plugin": "my_plugin",
+            "disabled": False,
+        }
+    ]
+    result = _run_commands_js(
+        """
+        await loadPicker();
+        const entries = await skillEntries('/my_plugin:my_skill');
+        return { entry: entries[0] || null };
+        """,
+        skills,
+    )
+
+    entry = result["entry"]
+    assert entry is not None, result
+    assert entry["name"] == "my_plugin:my_skill", result
+    assert entry["skillName"] == "my_plugin:my_skill", result
+    assert entry["plugin"] == "my_plugin", result
+
+
 def test_reserved_slash_command_still_wins():
     """Preserving ':' must not break reserved-command filtering.
 

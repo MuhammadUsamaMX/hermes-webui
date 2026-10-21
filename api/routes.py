@@ -15282,6 +15282,29 @@ def _list_plugin_skills_for_response(manager=None) -> list[dict]:
         if not isinstance(entries, list):
             return []
 
+        # Resolve each registered skill's SKILL.md inside the profile scope: the
+        # eligibility check below needs the file's own frontmatter, and the
+        # lookup must happen under the same scope as the listing (#7770).
+        skill_paths: dict[str, Path] = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            qualified = str(entry.get("name") or "").strip()
+            if not qualified:
+                continue
+            try:
+                found = manager.find_plugin_skill(qualified)
+            except Exception:
+                continue
+            if found is None:
+                continue
+            try:
+                path = Path(found)
+            except TypeError:
+                continue
+            if path.is_file():
+                skill_paths[qualified] = path
+
     # Eligibility and disabled state use the same contracts the directory scan
     # applies, keyed on the qualified name the agent resolves (#7770):
     # ``skill_matches_platform`` drops platform-restricted skills the native
@@ -15301,10 +15324,14 @@ def _list_plugin_skills_for_response(manager=None) -> list[dict]:
         namespace, bare = parse_qualified_name(raw_name)
         if not is_valid_namespace(namespace) or not bare:
             continue
-        frontmatter = entry.get("frontmatter")
-        # A registry entry without frontmatter is treated as unrestricted; the
-        # native listing does the same (an absent ``platforms:`` key matches all).
-        if not skill_matches_platform(frontmatter if isinstance(frontmatter, dict) else {}):
+        # The eligibility filter must read the SAME frontmatter the native
+        # listing reads: the SKILL.md's own. ``list_plugin_skill_metadata()``
+        # reports the frontmatter the plugin passed to ``register_skill()``,
+        # which is empty for a plugin that registers the skill by path only —
+        # so filtering on it would advertise a ``platforms: [windows]`` skill
+        # the Agent refuses (#7770).
+        frontmatter = _plugin_skill_frontmatter(entry, skill_paths.get(raw_name))
+        if not skill_matches_platform(frontmatter):
             continue
         description = str(entry.get("description") or "").strip()
         out.append(
@@ -15318,6 +15345,59 @@ def _list_plugin_skills_for_response(manager=None) -> list[dict]:
             }
         )
     return out
+
+
+def _plugin_skill_frontmatter(entry: dict, skill_md: Path | None) -> dict:
+    """Return the frontmatter the native listing would apply to a plugin skill.
+
+    The Agent parses the skill's own SKILL.md for eligibility (``platforms:``
+    and friends) and only falls back to the registration metadata. Mirror that
+    so the WebUI never advertises a skill the Agent refuses (#7770).
+
+    The parse helper is imported here, not at module scope: ``api.routes``
+    imports ``tools.skills_tool`` lazily inside each function, so a
+    module-level name would not exist and the ``except`` below would swallow
+    the ``NameError`` and silently fall back to the (usually empty)
+    registration frontmatter — advertising a platform-restricted skill the
+    Agent refuses.
+    """
+    from tools.skills_tool import _parse_frontmatter
+
+    registration = entry.get("frontmatter")
+    registration = registration if isinstance(registration, dict) else {}
+    if skill_md is None:
+        return registration
+    try:
+        content = skill_md.read_text(encoding="utf-8")[:4000]
+    except Exception:
+        return registration
+    try:
+        parsed, _body = _parse_frontmatter(content)
+    except Exception:
+        return registration
+    if not isinstance(parsed, dict) or not parsed:
+        return registration
+    merged = dict(registration)
+    merged.update(parsed)
+    return merged
+
+
+def _is_plugin_skill_name(name: str) -> bool:
+    """True when *name* is a plugin-qualified skill the registry knows about.
+
+    A ``plugin:skill`` name that resolves through the plugin registry is owned
+    by the plugin package: it is read-only in the WebUI (saving it would create
+    a partial local copy that shadows the real skill) and it is not deletable
+    from the local skills tree (#7770).
+
+    Fail-soft: an unavailable plugin subsystem, a name that is not qualified,
+    or an unknown plugin skill all return False, so ordinary directory-skill
+    edit/delete keeps working exactly as before.
+    """
+    raw_name = str(name or "").strip()
+    if ":" not in raw_name:
+        return False
+    return _plugin_skill_path_for(raw_name) is not None
 
 
 def _plugin_skill_path_for(name: str, manager=None) -> Path | None:
@@ -33829,6 +33909,15 @@ def _handle_skill_save(handler, body):
     skill_name = body["name"].strip().lower().replace(" ", "-")
     if not skill_name or "/" in skill_name or ".." in skill_name:
         return bad(handler, "Invalid skill name")
+    # A plugin-registered skill lives in the plugin package, not in the local
+    # skills/ tree. Saving one here would create a partial local copy that
+    # shadows the plugin's real skill (and drops its linked files) (#7770).
+    if _is_plugin_skill_name(body["name"]):
+        return bad(
+            handler,
+            f"Skill '{body['name']}' is provided by a plugin and cannot be edited here",
+            409,
+        )
     category = body.get("category", "").strip()
     if category and ("/" in category or ".." in category):
         return bad(handler, "Invalid category")
@@ -33862,6 +33951,15 @@ def _handle_skill_delete(handler, body):
     skill_name = str(body["name"]).strip().lower().replace(" ", "-")
     if not skill_name or "/" in skill_name or ".." in skill_name:
         return bad(handler, "Invalid skill name")
+    # A plugin-registered skill is owned by the plugin package: it is not in
+    # the local skills tree, so deleting it here can only ever 404 while the
+    # plugin keeps serving it (#7770). Say so instead of pretending it is gone.
+    if _is_plugin_skill_name(body["name"]):
+        return bad(
+            handler,
+            f"Skill '{body['name']}' is provided by a plugin and cannot be deleted here",
+            409,
+        )
     skills_dir = _active_skills_dir()
     matches = [p for p in skills_dir.rglob("SKILL.md") if p.parent.name == skill_name]
     if not matches:

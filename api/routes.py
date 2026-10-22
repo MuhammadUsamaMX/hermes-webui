@@ -18744,8 +18744,11 @@ def handle_post(handler, parsed) -> bool:
         # and would otherwise recreate the session being deleted.
         from api.config import _evict_session_agent
         _evict_session_agent(sid)
-        # Serialize with recovery, but bound contention so a browser timeout
-        # cannot be followed by a delayed server-side delete.
+        # Clear pending goal continuation and bg task completions so deleted
+        # sessions don't retain prompts in memory (#issue-8340 slice 1).
+        from api.config import PENDING_GOAL_CONTINUATION, PENDING_BG_TASK_COMPLETIONS
+        PENDING_GOAL_CONTINUATION.discard(sid)
+        PENDING_BG_TASK_COMPLETIONS.discard(sid)
         session_lock = _get_session_agent_lock(sid)
         if not session_lock.acquire(timeout=5):
             return bad(handler, "Session busy, try again", 503)
@@ -27401,7 +27404,7 @@ def _start_chat_stream_for_session(
     def consume_continuation_markers() -> None:
         nonlocal goal_related, consumed_goal_continuation, consumed_goal_prompt
         nonlocal consumed_bg_task_completion
-        if not goal_related and s.session_id in PENDING_GOAL_CONTINUATION:
+        if s.session_id in PENDING_GOAL_CONTINUATION:
             # #6885: a bare session marker cannot identify WHICH turn is the
             # continuation. Only the turn carrying the exact prompt the worker
             # emitted may claim it. A genuine user follow-up that arrives while
